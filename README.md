@@ -1,164 +1,129 @@
 # AIMemory
 
-AIMemory 是一个给本地 AI Agent 用的全域存储 Python 库。
+`AIMemory` 是一个给 AI Agent 用的本地化、轻量化、智能化全域存储 Python 库。
 
-你可以把它理解成一个“能直接嵌进代码里的记忆层”。  
-它不是云平台，也不是 HTTP 服务，更像是一个本地可调用的存储内核：把记忆、会话上下文、执行过程、知识文档、技能信息和归档，放进同一套库里管理。
+它不是云服务，不依赖额外数据库服务，不内置 LLM 推理链路。  
+它更像一个可以直接嵌入 Agent Runtime 的“本地记忆内核”：
 
-如果你正在做的是 OpenClaw 这一类智能体项目，这种形态通常会比较顺手：
+- 对上提供 MCP 友好的工具封装
+- 对下默认使用本地 SQLite，并可选接入 `LanceDB` / `FAISS` / `Kuzu`
+- 中间使用本地轻量算法做提取、检索、去重、压缩和归档
 
-- 直接在 Python 里调用，不用先搭服务
-- 长期记忆和会话记忆都能管
-- 知识、技能、执行轨迹也能一起存
-- 底层后端可以替换，但上层记忆逻辑尽量保持稳定
-- 默认就有召回、压缩、归档和治理能力
+## 设计目标
 
----
+- 轻量：默认只需要本地文件目录
+- 智能：不用规则词表驱动主流程，改为本地统计与语义算法
+- 全域：统一管理长期记忆、短期记忆、知识库、技能、归档和会话上下文
+- 易扩展：向量库、图数据库、MCP 适配都可插件化替换
 
-## 项目现在做到哪一步了
+## 当前实现
 
-从当前仓库实现来看，AIMemory 已经不是一个只会“存几条记忆再做检索”的小样例了。  
-它现在更接近一个轻量的 Agent Storage Kernel，核心能力已经比较完整：
+当前主入口为：
 
-- 对外统一入口：`AIMemory`、`AsyncAIMemory`
-- 记忆智能写入：`add()` 默认经过 `MemoryIntelligencePipeline`
-- 多域统一检索：可以在 `memory / knowledge / skill / archive / execution / interaction` 之间路由
-- 插件化后端：索引后端、图后端、抽取器、规划器、重排器都做了抽象层
-- 轻量治理：支持会话压缩、session memory 晋升、低价值记忆清理、综合治理
+- `AIMemory`
+- `AsyncAIMemory`
+- `AIMemoryMCPAdapter`
 
-默认配置下，它会优先尝试：
+当前主算法栈为：
 
-- 索引后端：`lancedb`
-- 图后端：`kuzu`
+- 自适应信息蒸馏：按新颖度、信息密度、长度和多样性选取候选记忆
+- 混合检索：稀疏 token 匹配 + 本地哈希向量 + 时间衰减
+- 语义去重：SimHash + 轻量向量相似度联合判重
+- 本地压缩：MMR 多样性重排 + 预算内摘要压缩
 
-如果环境里没有这些依赖，也不会把整套库卡死，而是自动回退到 `sqlite`。
+当前默认词嵌入配置为：
 
----
+- 模型：`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`
+- 维度：`384`
+- 可替换为其他本地 `sentence-transformers` 模型
+- 若本地环境未安装或模型不可用，会自动回退到轻量哈希嵌入
 
-## 文档怎么读
+当前存储策略为：
 
-这次文档拆成了几份，分工比较明确：
+- 长期记忆：`memories` + `memory_index`
+- 短期记忆：`conversation_turns` + `working_memory_snapshots` + session scope memory
+- 知识库：`documents` + `document_chunks` + `knowledge_chunk_index`
+- 技能：`skills` + `skill_versions` + `skill_index`
+- 归档：`archive_units` + `archive_summaries` + `archive_summary_index`
+- 语义缓存：`semantic_index_cache`
 
-- `README.md`
-  - 项目说明、架构概览、文档入口
-- `QUICKSTART.md`
-  - 快速开始、安装、配置、常见工作流、上手示例
-- `facade-api.md`
-  - `AIMemory` / `AsyncAIMemory` 的公开接口文档
-- `service-worker-api.md`
-  - 内部 service / worker 的接口文档和进阶用法
-- `API_REFERENCE.md`
-  - 一个简短的接口索引页，方便从旧入口跳转
+## 后端插件
 
-如果你是第一次看这个项目，建议顺序是：
+默认后端：
 
-1. 先看 `QUICKSTART.md`
-2. 再看 `facade-api.md`
-3. 有需要时再看 `service-worker-api.md`
+- 关系型：`SQLite`
+- 向量：`sqlite` 语义缓存回退
+- 图：`sqlite` 图关系回退
 
----
+可选后端：
 
-## 架构大意
+- 向量：`lancedb`、`faiss`
+- 图：`kuzu`
 
-可以先把它理解成下面这层结构：
-
-```text
-AIMemory / AsyncAIMemory
-  ├─ MemoryIntelligencePipeline
-  │   ├─ Vision Processor（当前是占位接口）
-  │   ├─ Fact Extractor（规则抽取）
-  │   ├─ Memory Planner（证据式动作规划）
-  │   └─ Retrieval Service（召回与重排）
-  ├─ Domain Services
-  │   ├─ MemoryService
-  │   ├─ InteractionService
-  │   ├─ ExecutionService
-  │   ├─ KnowledgeService
-  │   ├─ SkillService
-  │   └─ ArchiveService
-  ├─ ProjectionService
-  │   ├─ Index Backend
-  │   └─ Graph Backend
-  └─ Workers
-      ├─ ProjectorWorker
-      ├─ SessionCompactionWorker
-      ├─ SessionMemoryPromoterWorker
-      ├─ LowValueMemoryCleanerWorker
-      └─ GovernanceAutomationWorker
-```
-
-主流程也不复杂：
-
-1. 通过 facade 写入数据
-2. 主数据先落到 SQLite
-3. 再通过 outbox 投影到索引和图后端
-4. 检索时由 recall planner 决定先查什么、再补什么
-
----
-
-## 安装
-
-最小安装：
-
-```bash
-pip install -e .
-```
-
-如果你想跑开发依赖：
-
-```bash
-pip install -e .[dev]
-```
-
-如果你想把默认偏好的后端也装上：
-
-```bash
-pip install -e .[lancedb,kuzu]
-```
-
----
+这些后端都不是必须的；缺少依赖时会自动回退到本地 SQLite 方案。
 
 ## 一个最短示例
 
 ```python
 from aimemory import AIMemory
 
-# 用 with 打开，结束时会自动关闭连接
-with AIMemory({"root_dir": ".aimemory-demo"}) as store:
-    # 显式写入一条长期记忆
-    memory = store.memory_store(
+with AIMemory({"root_dir": ".aimemory-demo"}) as memory:
+    session = memory.create_session("user-1", title="demo")
+
+    memory.append_turn(
+        session["id"],
+        "user",
+        "我偏好 Markdown 列表输出，并且希望尽量节省 token。",
+    )
+
+    memory.remember_long_term(
         "用户偏好 Markdown 列表输出。",
         user_id="user-1",
-        long_term=True,
         memory_type="preference",
+        importance=0.9,
     )
 
-    # 搜索相关记忆
-    result = store.search(
-        "用户喜欢什么输出格式",
+    memory.ingest_document(
+        "上下文压缩策略",
+        "AIMemory 使用本地算法对会话做压缩与归档。",
         user_id="user-1",
-        top_k=5,
     )
 
-    print(memory)
+    result = memory.query(
+        "用户偏好什么输出形式，以及如何压缩上下文",
+        user_id="user-1",
+        session_id=session["id"],
+        limit=8,
+    )
+
     print(result["results"])
 ```
 
-更完整的上手说明，请直接看 `QUICKSTART.md`。
+## MCP 封装
 
----
+不启动服务时，你可以直接把工具定义暴露给上层 Agent：
 
-## 当前校验情况
+```python
+from aimemory import AIMemory
 
-这次文档改动没有动业务代码。  
-我额外做了一次最小 smoke test，确认下面这条主路径能正常跑通：
+memory = AIMemory({"root_dir": ".aimemory-demo"})
+adapter = memory.create_mcp_adapter()
 
-- 创建 `AIMemory`
-- 写入一条记忆
-- 搜索这条记忆
-
-如果你后面恢复了项目自己的测试目录，也可以再执行：
-
-```bash
-pytest -q
+tools = adapter.tool_specs()
+result = adapter.call_tool("memory_search", {"query": "Markdown 输出", "user_id": "user-1"})
 ```
+
+如果本地环境安装了 `mcp`，也可以把这些工具注册到 `FastMCP`，但库本身不负责运行服务。
+
+## 当前状态
+
+这次重构的主路径已经覆盖：
+
+- 长期 / 短期记忆写入与搜索
+- 会话压缩与会话记忆晋升
+- 知识文档切块与检索
+- 技能保存与检索
+- 归档摘要与统一查询
+- MCP 工具描述与调用桥接
+
+我已做过一轮最小 smoke test，验证上述主路径可正常跑通。

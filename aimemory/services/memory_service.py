@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from aimemory.algorithms.affinity import MEMORY_TYPE_PROTOTYPES, best_label, blend_score_maps, normalize_score_map, prototype_affinities
 from aimemory.core.governance import (
     evaluate_memory_value,
     governance_scope_rules,
@@ -678,21 +679,17 @@ class MemoryService(ServiceBase):
         run_id: str | None,
         role: str | None,
     ) -> str | None:
-        lowered = text.lower()
-        policy = self.config.memory_policy
-        if any(cue in lowered or cue in text for cue in policy.preference_cues):
-            return str(MemoryType.PREFERENCE)
-        if any(cue in lowered or cue in text for cue in policy.relationship_cues):
-            return str(MemoryType.RELATIONSHIP_SUMMARY)
-        if any(cue in lowered or cue in text for cue in policy.profile_cues):
-            return str(MemoryType.PROFILE)
-        if run_id and any(cue in lowered or cue in text for cue in policy.episodic_cues):
-            return str(MemoryType.EPISODIC)
-        if any(cue in lowered or cue in text for cue in policy.procedural_cues):
-            return str(MemoryType.PROCEDURAL)
-        if agent_id and role == "assistant" and any(cue in lowered or cue in text for cue in ("should", "需要", "先", "然后")):
-            return str(MemoryType.PROCEDURAL)
-        return None
+        base = prototype_affinities(text, MEMORY_TYPE_PROTOTYPES, dense_weight=0.76, sparse_weight=0.2, containment_weight=0.04)
+        bias = {key: 0.0 for key in MEMORY_TYPE_PROTOTYPES}
+        if run_id:
+            bias[str(MemoryType.EPISODIC)] += 0.1
+        if agent_id:
+            bias[str(MemoryType.PROCEDURAL)] += 0.08
+        if str(role or "").lower() == "assistant":
+            bias[str(MemoryType.PROCEDURAL)] += 0.06
+        combined = normalize_score_map(blend_score_maps(base, bias))
+        selected = best_label(combined, default=str(MemoryType.SEMANTIC))
+        return selected if float(combined.get(selected, 0.0)) >= 0.18 else None
 
     def _extract_candidates(self, messages: list[NormalizedMessage]) -> list[str]:
         candidates: list[str] = []

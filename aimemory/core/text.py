@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import math
 import re
 from collections import Counter
@@ -86,7 +85,9 @@ def chunk_text(text: str, chunk_size: int = 500, overlap: int = 80) -> list[str]
     return chunks
 
 
-def hash_embedding(text: str | None, dims: int = 128) -> list[float]:
+def lexical_hash_embedding(text: str | None, dims: int = 128) -> list[float]:
+    import hashlib
+
     vector = [0.0] * dims
     for token in tokenize(text):
         digest = hashlib.blake2b(token.encode("utf-8"), digest_size=16).digest()
@@ -98,6 +99,18 @@ def hash_embedding(text: str | None, dims: int = 128) -> list[float]:
     if norm == 0:
         return vector
     return [value / norm for value in vector]
+
+
+def hash_embedding(text: str | None, dims: int | None = None) -> list[float]:
+    try:
+        from aimemory.providers.embeddings import embed_text
+
+        vector = embed_text(text, dims=dims)
+        if vector:
+            return vector
+    except Exception:
+        pass
+    return lexical_hash_embedding(text, dims=dims or 128)
 
 
 def cosine_similarity(left: list[float], right: list[float]) -> float:

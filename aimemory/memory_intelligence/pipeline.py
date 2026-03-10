@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from aimemory.algorithms.affinity import coverage_ratio, tokens_density
 from aimemory.core.text import cosine_similarity, extract_keywords, hash_embedding, normalize_text
 from aimemory.memory_intelligence.models import (
     FactCandidate,
@@ -181,12 +182,21 @@ class MemoryIntelligencePipeline:
         )
 
     def _prefer_incoming(self, existing: FactCandidate, incoming: FactCandidate) -> bool:
-        incoming_lower = incoming.text.lower()
-        if any(cue in incoming_lower or cue in incoming.text for cue in self.policy.update_cues + self.policy.delete_cues):
-            return True
+        existing_score = (
+            (0.4 * float(existing.confidence))
+            + (0.35 * float(existing.importance))
+            + (0.15 * tokens_density(existing.text))
+            + (0.1 * coverage_ratio(existing.text, incoming.text))
+        )
+        incoming_score = (
+            (0.4 * float(incoming.confidence))
+            + (0.35 * float(incoming.importance))
+            + (0.15 * tokens_density(incoming.text))
+            + (0.1 * coverage_ratio(incoming.text, existing.text))
+        )
         if incoming.memory_type != existing.memory_type and incoming.memory_type != "semantic":
-            return True
-        return len(incoming.text) > len(existing.text)
+            incoming_score += 0.06
+        return incoming_score >= existing_score
 
     def _arbitrate_actions(self, actions: list[MemoryAction]) -> list[MemoryAction]:
         if not actions:

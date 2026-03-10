@@ -52,6 +52,12 @@ class SQLiteDatabase:
             rows = cursor.fetchall()
             return [dict(row) for row in rows]
 
+    def ensure_schema(self, statements: list[str]) -> None:
+        with self._lock:
+            for statement in statements:
+                self._connection.execute(statement)
+            self._connection.commit()
+
     def close(self) -> None:
         with self._lock:
             if self._closed:

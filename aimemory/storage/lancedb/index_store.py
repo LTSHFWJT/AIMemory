@@ -75,9 +75,10 @@ class LanceIndexStore:
         return self._db.create_table(table_name, data=[row], mode="overwrite")
 
     def _serialize_row(self, table_name: str, record_id: str, text: str, payload: dict[str, Any]) -> dict[str, Any]:
+        vector = json_loads(payload.get("embedding"), None)
         row: dict[str, Any] = {
             "id": record_id,
-            "vector": hash_embedding(text),
+            "vector": vector if isinstance(vector, list) and vector else hash_embedding(text),
             "text": text or "",
             "keywords": json_dumps(payload.get("keywords") or []),
             "updated_at": self._string(payload.get("updated_at")),

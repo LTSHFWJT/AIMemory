@@ -1,127 +1,221 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from dataclasses import asdict
+from typing import Any, Callable
 
+from aimemory.algorithms.compression import CompressionResult, compress_records
+from aimemory.algorithms.dedupe import fingerprint, hamming_similarity, merge_text_fragments, semantic_similarity
+from aimemory.algorithms.distill import AdaptiveDistiller, DistilledCandidate
+from aimemory.algorithms.retrieval import estimate_tokens, mmr_rerank, score_record
+from aimemory.backends.registry import BACKEND_REGISTRY
 from aimemory.core.capabilities import capability_dict
-from aimemory.core.governance import describe_governance_capabilities, describe_memory_type_policies
-from aimemory.core.router import RetrievalRouter
 from aimemory.core.settings import AIMemoryConfig
-from aimemory.memory_intelligence.pipeline import MemoryIntelligencePipeline
-from aimemory.providers.factory import LiteProviderFactory
-from aimemory.services.archive_service import ArchiveService
-from aimemory.services.execution_service import ExecutionService
-from aimemory.services.interaction_service import InteractionService
-from aimemory.services.knowledge_service import KnowledgeService
-from aimemory.services.memory_service import MemoryService
-from aimemory.services.projection_service import ProjectionService
-from aimemory.services.retrieval_service import RetrievalService
-from aimemory.services.skill_service import SkillService
-from aimemory.storage.kuzu.graph_store import KuzuGraphStore
-from aimemory.storage.lancedb.index_store import LanceIndexStore
+from aimemory.core.text import build_summary, chunk_text, extract_keywords, split_sentences
+from aimemory.core.utils import json_dumps, json_loads, make_id, merge_metadata, utcnow_iso
+from aimemory.domains.memory.models import MemoryScope, MemoryType
+from aimemory.memory_intelligence.models import MemoryScopeContext, NormalizedMessage
+from aimemory.providers.defaults import TextOnlyVisionProcessor
+from aimemory.providers.embeddings import configure_embedding_runtime, describe_embedding_runtime, embed_text
+from aimemory.querying.filters import filter_records
 from aimemory.storage.object_store.local import LocalObjectStore
 from aimemory.storage.sqlite.database import SQLiteDatabase
-from aimemory.workers.cleaner import LowValueMemoryCleanerWorker
-from aimemory.workers.compactor import SessionCompactionWorker
-from aimemory.workers.distiller import SessionMemoryPromoterWorker
-from aimemory.workers.governor import GovernanceAutomationWorker
-from aimemory.workers.projector import ProjectorWorker
+from aimemory.storage.sqlite.runtime_schema import EXTRA_SCHEMA_STATEMENTS
+
+
+def _loads(value: Any, default: Any) -> Any:
+    loaded = json_loads(value, default)
+    return default if loaded is None else loaded
+
+
+def _deserialize_row(row: dict[str, Any] | None, json_fields: tuple[str, ...] = ("metadata",)) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    item = dict(row)
+    for field in json_fields:
+        if field in item:
+            fallback: Any = [] if field.endswith("s") or field in {"keywords", "highlights"} else {}
+            item[field] = _loads(item.get(field), fallback)
+    return item
+
+
+def _deserialize_rows(rows: list[dict[str, Any]], json_fields: tuple[str, ...] = ("metadata",)) -> list[dict[str, Any]]:
+    return [item for item in (_deserialize_row(row, json_fields) for row in rows) if item is not None]
+
+
+def _domain_priority(domain: str) -> float:
+    return {
+        "memory": 0.06,
+        "interaction": 0.04,
+        "knowledge": 0.05,
+        "skill": 0.05,
+        "archive": -0.02,
+        "execution": 0.01,
+    }.get(domain, 0.0)
 
 
 class AIMemory:
     def __init__(self, config: AIMemoryConfig | dict[str, Any] | None = None):
         self.config = AIMemoryConfig.from_value(config)
+        configure_embedding_runtime(self.config.embeddings)
         self.db = SQLiteDatabase(self.config.sqlite_path)
+        self.db.ensure_schema(EXTRA_SCHEMA_STATEMENTS)
         self.object_store = LocalObjectStore(self.config.object_store_path)
-        use_lancedb_store = self.config.enable_lancedb or self.config.index_backend == "lancedb"
-        use_kuzu_store = self.config.enable_kuzu or self.config.graph_backend == "kuzu"
-        self.lancedb_store = LanceIndexStore(self.config.lancedb_path) if use_lancedb_store else None
-        self.kuzu_store = KuzuGraphStore(self.config.kuzu_path) if use_kuzu_store else None
-        self.router = RetrievalRouter()
-
-        self.llm_provider = LiteProviderFactory.create("llm", self.config.providers.llm)
-        self.vision_processor = LiteProviderFactory.create("vision", self.config.providers.vision)
-        self.fact_extractor = LiteProviderFactory.create("extractor", self.config.providers.extractor)
-        self.memory_planner = LiteProviderFactory.create("planner", self.config.providers.planner)
-        self.recall_planner = LiteProviderFactory.create("recall_planner", self.config.providers.recall_planner)
-        self.reranker = LiteProviderFactory.create("reranker", self.config.providers.reranker)
-        self.index_backend = LiteProviderFactory.create(
-            "index_backend",
-            self.config.index_backend,
-            db=self.db,
-            config=self.config,
-            lancedb_store=self.lancedb_store,
-        )
-        self.graph_backend = LiteProviderFactory.create(
-            "graph_backend",
-            self.config.graph_backend,
-            db=self.db,
-            config=self.config,
-            kuzu_store=self.kuzu_store,
-        )
-
-        self.projection = ProjectionService(self.db, self.config, index_backend=self.index_backend, graph_backend=self.graph_backend)
-        self.interaction = InteractionService(self.db, self.projection, self.config)
-        self.execution = ExecutionService(self.db, self.projection, self.config)
-        self.memory = MemoryService(self.db, self.projection, self.config, interaction_service=self.interaction)
-        self.knowledge = KnowledgeService(self.db, self.projection, self.config, object_store=self.object_store)
-        self.skills = SkillService(self.db, self.projection, self.config, object_store=self.object_store)
-        self.retrieve = RetrievalService(
-            self.db,
-            self.config,
-            router=self.router,
-            reranker=self.reranker,
-            index_backend=self.index_backend,
-            graph_backend=self.graph_backend,
-            recall_planner=self.recall_planner,
-        )
-        self.memory_pipeline = MemoryIntelligencePipeline(
-            vision_processor=self.vision_processor,
-            extractor=self.fact_extractor,
-            planner=self.memory_planner,
-            memory_service=self.memory,
-            retrieval_service=self.retrieve,
-            policy=self.config.memory_policy,
-        )
-        self.memory.set_intelligence_pipeline(self.memory_pipeline)
-        self.archive = ArchiveService(
-            self.db,
-            self.projection,
-            self.config,
-            object_store=self.object_store,
-            interaction_service=self.interaction,
-            memory_service=self.memory,
-        )
-        self.projector = ProjectorWorker(self.projection)
-        self.distiller = SessionMemoryPromoterWorker(self.memory)
-        self.compactor = SessionCompactionWorker(self.interaction)
-        self.cleaner = LowValueMemoryCleanerWorker(self.memory, self.archive)
-        self.governor = GovernanceAutomationWorker(self.interaction, self.memory, self.cleaner)
+        BACKEND_REGISTRY.bootstrap_defaults()
+        self.vector_index = BACKEND_REGISTRY.create_vector(self._resolve_vector_backend_name(), db=self.db, config=self.config)
+        self.graph_store = BACKEND_REGISTRY.create_graph(self._resolve_graph_backend_name(), db=self.db, config=self.config)
+        self.normalizer = TextOnlyVisionProcessor()
+        self.distiller = AdaptiveDistiller(self.config.memory_policy)
         self._closed = False
+
+    def _resolve_vector_backend_name(self) -> str:
+        if self.config.enable_lancedb:
+            return "lancedb"
+        if self.config.enable_faiss:
+            return "faiss"
+        if self.config.index_backend in {"sqlite", "lancedb", "faiss", "none"}:
+            return self.config.index_backend
+        return "sqlite"
+
+    def _resolve_graph_backend_name(self) -> str:
+        if self.config.enable_kuzu:
+            return "kuzu"
+        if self.config.graph_backend in {"sqlite", "kuzu", "none"}:
+            return self.config.graph_backend
+        return "sqlite"
 
     def add(self, messages, **kwargs) -> dict[str, Any]:
         kwargs = self._normalize_add_kwargs(kwargs)
-        return self.memory.add(messages, **kwargs)
+        normalized = self._normalize_messages(messages)
+        context = self._build_context(
+            user_id=kwargs.pop("user_id", None),
+            session_id=kwargs.pop("session_id", None),
+            agent_id=kwargs.pop("agent_id", None),
+            run_id=kwargs.pop("run_id", None),
+            actor_id=kwargs.pop("actor_id", None),
+            role=kwargs.pop("role", None),
+        )
+        metadata = dict(kwargs.pop("metadata", {}) or {})
+        long_term = bool(kwargs.pop("long_term", True))
+        infer = bool(kwargs.pop("infer", self.config.memory_policy.infer_by_default))
+        memory_type = str(kwargs.pop("memory_type", str(MemoryType.SEMANTIC)))
+        source = str(kwargs.pop("source", "conversation"))
+        background = self._background_texts(context=context, long_term=long_term)
+
+        if infer:
+            candidates = self.distiller.distill(normalized, background_texts=background, memory_type=memory_type)
+        else:
+            candidates = self._raw_candidates(normalized, memory_type=memory_type)
+
+        results: list[dict[str, Any]] = []
+        for candidate in candidates:
+            if candidate.score < self.config.memory_policy.short_term_capture_threshold and not long_term:
+                continue
+            stored = self._remember(
+                candidate.text,
+                user_id=context.user_id,
+                agent_id=context.agent_id,
+                session_id=context.session_id,
+                run_id=context.run_id,
+                metadata=merge_metadata(metadata, candidate.metadata),
+                memory_type=memory_type,
+                importance=max(0.25, candidate.score),
+                long_term=long_term,
+                source=source,
+            )
+            results.append(
+                {
+                    "event": stored.pop("_event", "ADD"),
+                    "id": stored["id"],
+                    "memory": stored["text"],
+                    "score": round(candidate.score, 6),
+                    "memory_type": stored["memory_type"],
+                }
+            )
+        return {"results": results, "facts": [item["memory"] for item in results]}
 
     def get(self, memory_id: str) -> dict[str, Any] | None:
-        return self.memory.get(memory_id)
+        row = self.db.fetch_one("SELECT * FROM memories WHERE id = ?", (memory_id,))
+        return _deserialize_row(row)
 
-    def get_all(self, **kwargs) -> dict[str, Any]:
-        kwargs = self._normalize_list_kwargs(kwargs)
-        return self.memory.get_all(**kwargs)
+    def get_all(
+        self,
+        user_id: str | None = None,
+        session_id: str | None = None,
+        scope: str = "all",
+        limit: int = 100,
+        offset: int = 0,
+        filters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        sql_filters = ["status != 'deleted'"]
+        params: list[Any] = []
+        if user_id:
+            sql_filters.append("user_id = ?")
+            params.append(user_id)
+        if session_id:
+            sql_filters.append("(session_id = ? OR session_id IS NULL)")
+            params.append(session_id)
+        if scope == str(MemoryScope.SESSION):
+            sql_filters.append("scope = ?")
+            params.append(str(MemoryScope.SESSION))
+        elif scope == str(MemoryScope.LONG_TERM):
+            sql_filters.append("scope = ?")
+            params.append(str(MemoryScope.LONG_TERM))
+        sql = f"SELECT * FROM memories WHERE {' AND '.join(sql_filters)} ORDER BY updated_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        rows = _deserialize_rows(self.db.fetch_all(sql, tuple(params)))
+        if filters:
+            rows = filter_records(rows, filters)
+        return {"results": rows, "count": len(rows), "limit": limit, "offset": offset}
 
     def search(self, query: str, **kwargs) -> dict[str, Any]:
         kwargs = self._normalize_search_kwargs(kwargs)
-        return self.retrieve.search_memory(query, **kwargs)
+        return self.memory_search(query, **kwargs)
 
     def update(self, memory_id: str, **kwargs) -> dict[str, Any]:
-        return self.memory.update(memory_id, **kwargs)
+        row = self.get(memory_id)
+        if row is None:
+            raise ValueError(f"Memory `{memory_id}` does not exist.")
+        metadata = merge_metadata(row.get("metadata"), kwargs.pop("metadata", None))
+        text = str(kwargs.pop("text", row["text"]))
+        summary = str(kwargs.pop("summary", build_summary(split_sentences(text), max_sentences=3, max_chars=200)))
+        importance = float(kwargs.pop("importance", row.get("importance", 0.5)))
+        status = str(kwargs.pop("status", row.get("status", "active")))
+        now = utcnow_iso()
+        self.db.execute(
+            """
+            UPDATE memories
+            SET text = ?, summary = ?, importance = ?, status = ?, metadata = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (text, summary, importance, status, json_dumps(metadata), now, memory_id),
+        )
+        self._record_memory_event(memory_id, "UPDATE", {"text": text, "metadata": metadata, "status": status})
+        updated = self.get(memory_id)
+        assert updated is not None
+        if status == "active":
+            self._index_memory(updated)
+        else:
+            self._delete_memory_index(memory_id)
+        updated["_event"] = "UPDATE"
+        return updated
 
     def delete(self, memory_id: str) -> dict[str, Any]:
-        return self.memory.delete(memory_id)
+        row = self.get(memory_id)
+        if row is None:
+            raise ValueError(f"Memory `{memory_id}` does not exist.")
+        now = utcnow_iso()
+        self.db.execute("UPDATE memories SET status = ?, updated_at = ? WHERE id = ?", ("deleted", now, memory_id))
+        self._delete_memory_index(memory_id)
+        self._record_memory_event(memory_id, "DELETE", {"deleted_at": now})
+        result = dict(row)
+        result["status"] = "deleted"
+        result["_event"] = "DELETE"
+        return result
 
     def history(self, memory_id: str) -> list[dict[str, Any]]:
-        return self.memory.history(memory_id)
+        rows = self.db.fetch_all("SELECT * FROM memory_events WHERE memory_id = ? ORDER BY created_at ASC", (memory_id,))
+        return _deserialize_rows(rows, ("payload",))
 
     def memory_store(
         self,
@@ -133,7 +227,13 @@ class AIMemory:
     ) -> dict[str, Any]:
         if "longTerm" in kwargs:
             long_term = bool(kwargs.pop("longTerm"))
-        return self.memory.remember(text=text, user_id=user_id, session_id=session_id, long_term=long_term, **kwargs)
+        return self._remember(text, user_id=user_id, session_id=session_id, long_term=long_term, **kwargs)
+
+    def remember_long_term(self, text: str, **kwargs) -> dict[str, Any]:
+        return self._remember(text, long_term=True, **kwargs)
+
+    def remember_short_term(self, text: str, **kwargs) -> dict[str, Any]:
+        return self._remember(text, long_term=False, **kwargs)
 
     def memory_search(
         self,
@@ -141,26 +241,53 @@ class AIMemory:
         user_id: str | None = None,
         session_id: str | None = None,
         scope: str = "all",
-        top_k: int = 5,
+        top_k: int = 8,
         search_threshold: float = 0.0,
         **kwargs,
     ) -> dict[str, Any]:
-        top_k = int(kwargs.pop("limit", kwargs.pop("topK", top_k)))
-        search_threshold = float(kwargs.pop("threshold", kwargs.pop("searchThreshold", search_threshold)))
-        scope = kwargs.pop("scope", scope)
-        return self.retrieve.search_memory(
-            query,
-            user_id=user_id,
-            session_id=session_id,
-            agent_id=kwargs.pop("agent_id", kwargs.pop("agentId", None)),
-            run_id=kwargs.pop("run_id", kwargs.pop("runId", None)),
-            actor_id=kwargs.pop("actor_id", kwargs.pop("actorId", None)),
-            role=kwargs.pop("role", None),
-            scope=scope,
-            limit=top_k,
-            threshold=search_threshold,
-            filters=kwargs.pop("filters", None),
+        limit = int(kwargs.pop("limit", kwargs.pop("topK", top_k)))
+        threshold = float(kwargs.pop("threshold", kwargs.pop("searchThreshold", search_threshold)))
+        filters = kwargs.pop("filters", None)
+        sql_filters = ["m.status = 'active'"]
+        params: list[Any] = []
+        if user_id:
+            sql_filters.append("m.user_id = ?")
+            params.append(user_id)
+        if session_id and scope == str(MemoryScope.SESSION):
+            sql_filters.append("m.session_id = ?")
+            params.append(session_id)
+        if scope == str(MemoryScope.SESSION):
+            sql_filters.append("m.scope = ?")
+            params.append(str(MemoryScope.SESSION))
+        elif scope == str(MemoryScope.LONG_TERM):
+            sql_filters.append("m.scope = ?")
+            params.append(str(MemoryScope.LONG_TERM))
+        elif session_id:
+            sql_filters.append("(m.scope = ? OR m.session_id = ?)")
+            params.extend([str(MemoryScope.LONG_TERM), session_id])
+
+        rows = self.db.fetch_all(
+            f"""
+            SELECT m.*, mi.keywords AS index_keywords, sic.embedding
+            FROM memories m
+            LEFT JOIN memory_index mi ON mi.record_id = m.id
+            LEFT JOIN semantic_index_cache sic ON sic.record_id = m.id
+            WHERE {' AND '.join(sql_filters)}
+            ORDER BY m.updated_at DESC
+            LIMIT ?
+            """,
+            tuple(params + [self.config.memory_policy.search_scan_limit]),
         )
+        vector_hits = self._vector_hit_map("memory_index", query, limit=max(limit * 4, 24))
+        results = self._rank_memory_rows(
+            query,
+            rows,
+            half_life_days=self.config.memory_policy.short_term_half_life_days if scope == str(MemoryScope.SESSION) else self.config.memory_policy.long_term_half_life_days,
+            threshold=threshold,
+            filters=filters,
+            vector_hits=vector_hits,
+        )
+        return {"results": results[:limit]}
 
     def memory_list(
         self,
@@ -175,18 +302,17 @@ class AIMemory:
         page_size = int(kwargs.pop("page_size", kwargs.pop("pageSize", limit)))
         if page > 1 and offset == 0:
             offset = (page - 1) * page_size
-        limit = page_size
-        return self.memory.get_all(
+        return self.get_all(
             user_id=user_id,
             session_id=session_id,
             scope=scope,
-            limit=limit,
+            limit=page_size,
             offset=offset,
             filters=kwargs.pop("filters", None),
         )
 
     def memory_get(self, memory_id: str) -> dict[str, Any] | None:
-        return self.memory.get(memory_id)
+        return self.get(memory_id)
 
     def memory_forget(
         self,
@@ -199,18 +325,15 @@ class AIMemory:
         **kwargs,
     ) -> dict[str, Any]:
         if memory_id:
-            return self.memory.delete(memory_id)
-        if query:
-            return self.memory.delete_by_query(
-                query,
-                retrieval_service=self.retrieve,
-                user_id=user_id,
-                session_id=session_id,
-                scope=scope,
-                limit=limit,
-                filters=kwargs.pop("filters", None),
-            )
-        raise ValueError("Either memory_id or query must be provided.")
+            deleted = self.delete(memory_id)
+            return {"results": [deleted]}
+        if not query:
+            raise ValueError("Either memory_id or query must be provided.")
+        found = self.memory_search(query, user_id=user_id, session_id=session_id, scope=scope, limit=limit, filters=kwargs.pop("filters", None))
+        deleted: list[dict[str, Any]] = []
+        for item in found["results"]:
+            deleted.append(self.delete(item["id"]))
+        return {"results": deleted}
 
     def query(
         self,
@@ -226,92 +349,988 @@ class AIMemory:
         limit: int = 10,
         threshold: float = 0.0,
     ) -> dict[str, Any]:
-        return self.retrieve.retrieve(
-            query,
-            user_id=user_id,
-            session_id=session_id,
-            agent_id=agent_id,
-            run_id=run_id,
-            actor_id=actor_id,
-            role=role,
-            domains=domains,
-            filters=filters,
-            limit=limit,
-            threshold=threshold,
-        )
+        searchers: dict[str, Callable[[], dict[str, Any]]] = {
+            "memory": lambda: self.memory_search(
+                query,
+                user_id=user_id,
+                session_id=session_id,
+                scope="all",
+                limit=max(limit, self.config.memory_policy.auxiliary_search_limit),
+                threshold=threshold,
+            ),
+            "interaction": lambda: self.search_interaction(
+                query,
+                user_id=user_id,
+                session_id=session_id,
+                limit=max(limit, self.config.memory_policy.auxiliary_search_limit),
+                threshold=threshold,
+            ),
+            "knowledge": lambda: self.search_knowledge(query, user_id=user_id, limit=max(limit, self.config.memory_policy.auxiliary_search_limit), threshold=threshold),
+            "skill": lambda: self.search_skills(query, limit=max(limit, self.config.memory_policy.auxiliary_search_limit), threshold=threshold),
+            "archive": lambda: self.search_archive(query, user_id=user_id, session_id=session_id, limit=max(limit, self.config.memory_policy.auxiliary_search_limit), threshold=threshold),
+            "execution": lambda: self.search_execution(query, user_id=user_id, session_id=session_id, limit=max(limit, self.config.memory_policy.auxiliary_search_limit), threshold=threshold),
+        }
+        selected_domains = domains or ["memory", "interaction", "knowledge", "skill", "archive"]
+        merged: list[dict[str, Any]] = []
+        for domain in selected_domains:
+            if domain not in searchers:
+                continue
+            payload = searchers[domain]()
+            for item in payload.get("results", []):
+                merged_item = dict(item)
+                merged_item["domain"] = domain
+                merged_item["score"] = round(float(merged_item.get("score", 0.0)) + _domain_priority(domain), 6)
+                merged.append(merged_item)
+        if filters:
+            merged = filter_records(merged, filters)
+        merged.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
+        merged = mmr_rerank(merged, lambda_value=self.config.memory_policy.diversity_lambda, limit=limit)
+        return {"results": merged[:limit]}
 
     def explain_recall(self, query: str, **kwargs) -> dict[str, Any]:
-        return self.retrieve.explain_memory_recall(query, **kwargs)
+        result = self.query(query, **kwargs)
+        return {
+            "query": query,
+            "policy": {
+                "vector_backend": getattr(self.vector_index, "name", "unknown"),
+                "graph_backend": getattr(self.graph_store, "active_backend", getattr(self.graph_store, "backend_name", "unknown")),
+                "diversity_lambda": self.config.memory_policy.diversity_lambda,
+                "scan_limit": self.config.memory_policy.search_scan_limit,
+            },
+            "results": result["results"],
+        }
 
     def create_session(self, user_id: str, session_id: str | None = None, **kwargs) -> dict[str, Any]:
-        return self.interaction.create_session(user_id=user_id, session_id=session_id, **kwargs)
+        session_id = session_id or make_id("sess")
+        now = utcnow_iso()
+        metadata = dict(kwargs.pop("metadata", {}) or {})
+        agent_id = kwargs.pop("agent_id", None)
+        title = kwargs.pop("title", None)
+        self.db.execute(
+            """
+            INSERT INTO sessions(id, user_id, agent_id, title, status, metadata, active_window, ttl_seconds, expires_at, last_accessed_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                user_id,
+                agent_id,
+                title,
+                "active",
+                json_dumps(metadata),
+                "",
+                int(kwargs.pop("ttl_seconds", self.config.session_ttl_seconds)),
+                None,
+                now,
+                now,
+                now,
+            ),
+        )
+        return self.get_session(session_id)
+
+    def get_session(self, session_id: str) -> dict[str, Any] | None:
+        row = self.db.fetch_one("SELECT * FROM sessions WHERE id = ?", (session_id,))
+        return _deserialize_row(row)
 
     def append_turn(self, session_id: str, role: str, content: str, **kwargs) -> dict[str, Any]:
-        return self.interaction.append_turn(session_id=session_id, role=role, content=content, **kwargs)
+        session = self.get_session(session_id)
+        if session is None:
+            raise ValueError(f"Session `{session_id}` does not exist.")
+        turn_id = make_id("turn")
+        now = utcnow_iso()
+        metadata = dict(kwargs.pop("metadata", {}) or {})
+        run_id = kwargs.pop("run_id", None)
+        name = kwargs.pop("name", None)
+        self.db.execute(
+            """
+            INSERT INTO conversation_turns(id, session_id, run_id, role, content, name, metadata, tokens_in, tokens_out, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                turn_id,
+                session_id,
+                run_id,
+                role,
+                content,
+                name,
+                json_dumps(metadata),
+                kwargs.pop("tokens_in", None),
+                kwargs.pop("tokens_out", None),
+                now,
+            ),
+        )
+        self.db.execute("UPDATE sessions SET updated_at = ?, last_accessed_at = ? WHERE id = ?", (now, now, session_id))
+        auto_capture = bool(kwargs.pop("auto_capture", True))
+        auto_compress = bool(kwargs.pop("auto_compress", True))
+        captured = None
+        if auto_capture:
+            capture_result = self.add(
+                [{"role": role, "content": content, "name": name, "metadata": metadata}],
+                user_id=session["user_id"],
+                session_id=session_id,
+                agent_id=session.get("agent_id"),
+                run_id=run_id,
+                long_term=False,
+                source="conversation_turn",
+                infer=True,
+            )
+            captured = capture_result["results"]
+        health = self.session_health(session_id)
+        compressed = None
+        if auto_compress and health["turn_count"] >= self.config.memory_policy.compression_turn_threshold:
+            compressed = self.compress_session_context(session_id)
+        return {
+            "id": turn_id,
+            "session_id": session_id,
+            "role": role,
+            "content": content,
+            "captured": captured or [],
+            "compressed": compressed,
+        }
 
     def start_run(self, user_id: str, goal: str, **kwargs) -> dict[str, Any]:
-        return self.execution.start_run(user_id=user_id, goal=goal, **kwargs)
+        run_id = kwargs.pop("run_id", make_id("run"))
+        now = utcnow_iso()
+        self.db.execute(
+            """
+            INSERT INTO runs(id, session_id, user_id, agent_id, goal, status, metadata, started_at, ended_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                kwargs.pop("session_id", None),
+                user_id,
+                kwargs.pop("agent_id", None),
+                goal,
+                kwargs.pop("status", "running"),
+                json_dumps(kwargs.pop("metadata", {}) or {}),
+                now,
+                None,
+                now,
+            ),
+        )
+        return _deserialize_row(self.db.fetch_one("SELECT * FROM runs WHERE id = ?", (run_id,)))
 
     def ingest_document(self, title: str, text: str, **kwargs) -> dict[str, Any]:
-        return self.knowledge.ingest_text(title=title, text=text, **kwargs)
+        source_name = kwargs.pop("source_name", title)
+        source_type = kwargs.pop("source_type", "inline")
+        uri = kwargs.pop("uri", None)
+        user_id = kwargs.pop("user_id", None)
+        external_id = kwargs.pop("external_id", None)
+        metadata = dict(kwargs.pop("metadata", {}) or {})
+        chunk_size = int(kwargs.pop("chunk_size", self.config.memory_policy.chunk_size))
+        chunk_overlap = int(kwargs.pop("chunk_overlap", self.config.memory_policy.chunk_overlap))
+        now = utcnow_iso()
+
+        source = self.db.fetch_one("SELECT * FROM knowledge_sources WHERE name = ? AND source_type = ?", (source_name, source_type))
+        if source is None:
+            source_id = make_id("source")
+            self.db.execute(
+                """
+                INSERT INTO knowledge_sources(id, name, source_type, uri, metadata, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (source_id, source_name, source_type, uri, json_dumps(metadata), now, now),
+            )
+        else:
+            source_id = source["id"]
+
+        document_id = make_id("doc")
+        self.db.execute(
+            """
+            INSERT INTO documents(id, source_id, title, user_id, external_id, status, metadata, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (document_id, source_id, title, user_id, external_id, "active", json_dumps(metadata), now, now),
+        )
+        stored = self.object_store.put_text(text, object_type="knowledge", suffix=".txt")
+        object_row = self._persist_object(stored, mime_type="text/plain", metadata={"document_id": document_id, **metadata})
+        version_id = make_id("docver")
+        self.db.execute(
+            """
+            INSERT INTO document_versions(id, document_id, version_label, object_id, checksum, size_bytes, metadata, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (version_id, document_id, "v1", object_row["id"], object_row["checksum"], object_row["size_bytes"], json_dumps(metadata), now),
+        )
+        chunks = chunk_text(text, chunk_size=chunk_size, overlap=chunk_overlap)
+        for index, chunk in enumerate(chunks):
+            chunk_id = make_id("chunk")
+            chunk_metadata = {"chunk_index": index, **metadata}
+            self.db.execute(
+                """
+                INSERT INTO document_chunks(id, document_id, version_id, chunk_index, content, tokens, metadata, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (chunk_id, document_id, version_id, index, chunk, estimate_tokens(chunk), json_dumps(chunk_metadata), now),
+            )
+            self._index_knowledge_chunk(
+                {
+                    "id": chunk_id,
+                    "document_id": document_id,
+                    "source_id": source_id,
+                    "title": title,
+                    "content": chunk,
+                    "metadata": chunk_metadata,
+                    "updated_at": now,
+                }
+            )
+        return self.get_document(document_id)
+
+    def ingest_knowledge(self, title: str, text: str, **kwargs) -> dict[str, Any]:
+        return self.ingest_document(title, text, **kwargs)
+
+    def get_document(self, document_id: str) -> dict[str, Any] | None:
+        row = self.db.fetch_one("SELECT * FROM documents WHERE id = ?", (document_id,))
+        document = _deserialize_row(row)
+        if document is None:
+            return None
+        versions = _deserialize_rows(self.db.fetch_all("SELECT * FROM document_versions WHERE document_id = ? ORDER BY created_at DESC", (document_id,)))
+        chunks = _deserialize_rows(self.db.fetch_all("SELECT * FROM document_chunks WHERE document_id = ? ORDER BY chunk_index ASC", (document_id,)))
+        document["versions"] = versions
+        document["chunks"] = chunks
+        return document
+
+    def search_knowledge(
+        self,
+        query: str,
+        user_id: str | None = None,
+        limit: int = 10,
+        threshold: float = 0.0,
+        filters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        rows = self.db.fetch_all(
+            """
+            SELECT dc.id, dc.document_id, dc.content AS text, dc.metadata, d.title, d.user_id, d.updated_at, sic.embedding
+            FROM document_chunks dc
+            JOIN documents d ON d.id = dc.document_id
+            LEFT JOIN semantic_index_cache sic ON sic.record_id = dc.id
+            WHERE d.status = 'active' AND (? IS NULL OR d.user_id = ?)
+            ORDER BY d.updated_at DESC, dc.chunk_index ASC
+            LIMIT ?
+            """,
+            (user_id, user_id, max(limit * 12, self.config.memory_policy.search_scan_limit // 2)),
+        )
+        vector_hits = self._vector_hit_map("knowledge_chunk_index", query, limit=max(limit * 4, 24))
+        ranked = self._rank_rows(
+            query,
+            rows,
+            domain="knowledge",
+            text_key="text",
+            keywords_getter=lambda row: extract_keywords(" ".join(part for part in [row.get("title"), row.get("text")] if part)),
+            updated_at_key="updated_at",
+            importance_getter=lambda row: 0.72,
+            half_life_days=self.config.memory_policy.knowledge_half_life_days,
+            threshold=threshold,
+            filters=filters,
+            vector_hits=vector_hits,
+        )
+        return {"results": ranked[:limit]}
+
+    def save_skill(self, name: str, description: str, **kwargs) -> dict[str, Any]:
+        now = utcnow_iso()
+        skill = self.db.fetch_one("SELECT * FROM skills WHERE name = ?", (name,))
+        metadata = dict(kwargs.pop("metadata", {}) or {})
+        owner_id = kwargs.pop("owner_id", None)
+        if skill is None:
+            skill_id = make_id("skill")
+            self.db.execute(
+                """
+                INSERT INTO skills(id, name, description, owner_id, status, metadata, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (skill_id, name, description, owner_id, "active", json_dumps(metadata), now, now),
+            )
+        else:
+            skill_id = skill["id"]
+            merged_metadata = merge_metadata(_loads(skill.get("metadata"), {}), metadata)
+            self.db.execute(
+                """
+                UPDATE skills
+                SET description = ?, owner_id = ?, metadata = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (description, owner_id or skill.get("owner_id"), json_dumps(merged_metadata), now, skill_id),
+            )
+
+        version = kwargs.pop("version", f"v{len(self.db.fetch_all('SELECT id FROM skill_versions WHERE skill_id = ?', (skill_id,))) + 1}")
+        prompt_template = kwargs.pop("prompt_template", None)
+        workflow = kwargs.pop("workflow", None)
+        schema = kwargs.pop("schema", None)
+        tools = list(kwargs.pop("tools", []) or [])
+        tests = list(kwargs.pop("tests", []) or [])
+        topics = list(kwargs.pop("topics", []) or [])
+        asset_payload = {
+            "name": name,
+            "description": description,
+            "workflow": workflow,
+            "schema": schema,
+            "tools": tools,
+            "topics": topics,
+            "tests": tests,
+            "metadata": metadata,
+        }
+        stored = self.object_store.put_text(json_dumps(asset_payload), object_type="skills", suffix=".json")
+        object_row = self._persist_object(stored, mime_type="application/json", metadata={"skill_id": skill_id, **metadata})
+        version_id = make_id("skillver")
+        workflow_text = workflow if isinstance(workflow, str) else json_dumps(workflow or {})
+        self.db.execute(
+            """
+            INSERT INTO skill_versions(id, skill_id, version, prompt_template, workflow, schema_json, object_id, changelog, metadata, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (version_id, skill_id, version, prompt_template, workflow_text, json_dumps(schema or {}), object_row["id"], None, json_dumps(metadata), now),
+        )
+        for tool_name in tools:
+            self.db.execute(
+                """
+                INSERT INTO skill_bindings(id, skill_version_id, tool_name, binding_type, config, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (make_id("bind"), version_id, tool_name, "tool", json_dumps({}), now),
+            )
+        for test_case in tests:
+            self.db.execute(
+                """
+                INSERT INTO skill_tests(id, skill_version_id, input_payload, expected_output, metadata, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    make_id("stest"),
+                    version_id,
+                    json_dumps(test_case.get("input", {})),
+                    json_dumps(test_case.get("expected")),
+                    json_dumps(test_case.get("metadata", {})),
+                    now,
+                ),
+            )
+        self._index_skill(
+            {
+                "record_id": version_id,
+                "skill_id": skill_id,
+                "version": version,
+                "name": name,
+                "description": description,
+                "text": "\n".join(part for part in [name, description, prompt_template or "", workflow_text, " ".join(topics), " ".join(tools)] if part),
+                "tools": tools,
+                "topics": topics,
+                "metadata": metadata,
+                "updated_at": now,
+            }
+        )
+        return self.get_skill(skill_id)
 
     def register_skill(self, name: str, description: str, **kwargs) -> dict[str, Any]:
-        return self.skills.register(name=name, description=description, **kwargs)
+        return self.save_skill(name, description, **kwargs)
+
+    def get_skill(self, skill_id: str) -> dict[str, Any] | None:
+        skill = _deserialize_row(self.db.fetch_one("SELECT * FROM skills WHERE id = ?", (skill_id,)))
+        if skill is None:
+            return None
+        skill["versions"] = _deserialize_rows(self.db.fetch_all("SELECT * FROM skill_versions WHERE skill_id = ? ORDER BY created_at DESC", (skill_id,)), ("metadata", "schema_json"))
+        skill["bindings"] = _deserialize_rows(
+            self.db.fetch_all(
+                """
+                SELECT sb.* FROM skill_bindings sb
+                JOIN skill_versions sv ON sv.id = sb.skill_version_id
+                WHERE sv.skill_id = ?
+                ORDER BY sb.created_at ASC
+                """,
+                (skill_id,),
+            ),
+            ("config",),
+        )
+        skill["tests"] = _deserialize_rows(
+            self.db.fetch_all(
+                """
+                SELECT st.* FROM skill_tests st
+                JOIN skill_versions sv ON sv.id = st.skill_version_id
+                WHERE sv.skill_id = ?
+                ORDER BY st.created_at ASC
+                """,
+                (skill_id,),
+            ),
+            ("input_payload", "expected_output", "metadata"),
+        )
+        return skill
+
+    def list_skills(self, status: str | None = None) -> dict[str, Any]:
+        if status:
+            rows = self.db.fetch_all("SELECT * FROM skills WHERE status = ? ORDER BY updated_at DESC", (status,))
+        else:
+            rows = self.db.fetch_all("SELECT * FROM skills ORDER BY updated_at DESC")
+        return {"results": _deserialize_rows(rows)}
+
+    def search_skills(
+        self,
+        query: str,
+        limit: int = 10,
+        threshold: float = 0.0,
+        filters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        rows = self.db.fetch_all(
+            """
+            SELECT si.*, s.status, sic.embedding
+            FROM skill_index si
+            JOIN skills s ON s.id = si.skill_id
+            LEFT JOIN semantic_index_cache sic ON sic.record_id = si.record_id
+            WHERE s.status = 'active'
+            ORDER BY si.updated_at DESC
+            LIMIT ?
+            """,
+            (max(limit * 12, self.config.memory_policy.search_scan_limit // 2),),
+        )
+        vector_hits = self._vector_hit_map("skill_index", query, limit=max(limit * 4, 24))
+        ranked = self._rank_rows(
+            query,
+            rows,
+            domain="skill",
+            text_key="text",
+            keywords_getter=lambda row: extract_keywords(" ".join(part for part in [row.get("name"), row.get("description"), row.get("text")] if part)),
+            updated_at_key="updated_at",
+            importance_getter=lambda row: 0.78,
+            half_life_days=self.config.memory_policy.knowledge_half_life_days,
+            threshold=threshold,
+            filters=filters,
+            vector_hits=vector_hits,
+        )
+        return {"results": ranked[:limit]}
+
+    def archive_memory(self, memory_id: str, **kwargs) -> dict[str, Any]:
+        memory = self.get(memory_id)
+        if memory is None:
+            raise ValueError(f"Memory `{memory_id}` does not exist.")
+        if memory.get("status") == "archived":
+            return {"memory": memory, "archive": None}
+        now = utcnow_iso()
+        metadata = dict(kwargs.pop("metadata", {}) or {})
+        payload = {"memory": memory, "metadata": metadata}
+        stored = self.object_store.put_text(json_dumps(payload), object_type="archive", suffix=".json")
+        object_row = self._persist_object(stored, mime_type="application/json", metadata={"memory_id": memory_id, **metadata})
+        archive_id = make_id("arch")
+        summary_text = memory.get("summary") or build_summary(split_sentences(memory["text"]), max_sentences=3, max_chars=240)
+        self.db.execute(
+            """
+            INSERT INTO archive_units(id, domain, source_id, user_id, session_id, object_id, summary, metadata, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (archive_id, "memory", memory_id, memory.get("user_id"), memory.get("session_id"), object_row["id"], summary_text, json_dumps(metadata), now),
+        )
+        summary_id = make_id("archsum")
+        highlights = [memory["text"], summary_text]
+        self.db.execute(
+            """
+            INSERT INTO archive_summaries(id, archive_unit_id, summary, highlights, metadata, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (summary_id, archive_id, summary_text, json_dumps(highlights), json_dumps(metadata), now),
+        )
+        self.db.execute("UPDATE memories SET status = ?, archived_at = ?, updated_at = ? WHERE id = ?", ("archived", now, now, memory_id))
+        self._delete_memory_index(memory_id)
+        self._index_archive_summary(
+            {
+                "record_id": summary_id,
+                "archive_unit_id": archive_id,
+                "domain": "memory",
+                "user_id": memory.get("user_id"),
+                "session_id": memory.get("session_id"),
+                "text": summary_text,
+                "metadata": {"source_memory_id": memory_id, **metadata},
+                "updated_at": now,
+            }
+        )
+        self._record_memory_event(memory_id, "ARCHIVE", {"archive_unit_id": archive_id})
+        return {"memory": self.get(memory_id), "archive": self.get_archive_unit(archive_id)}
 
     def archive_session(self, session_id: str, **kwargs) -> dict[str, Any]:
-        return self.archive.archive_session(session_id=session_id, **kwargs)
+        session = self.get_session(session_id)
+        if session is None:
+            raise ValueError(f"Session `{session_id}` does not exist.")
+        turns = self._session_turns(session_id)
+        snapshots = _deserialize_rows(self.db.fetch_all("SELECT * FROM working_memory_snapshots WHERE session_id = ? ORDER BY updated_at DESC", (session_id,)))
+        memories = self.memory_list(user_id=session["user_id"], session_id=session_id, scope=str(MemoryScope.SESSION), limit=200)["results"]
+        compression = compress_records(
+            [
+                *[{"id": item["id"], "text": item["content"], "score": 0.6} for item in turns],
+                *[{"id": item["id"], "text": item.get("summary", ""), "score": 0.7} for item in snapshots],
+                *[{"id": item["id"], "text": item["text"], "score": float(item.get("importance", 0.5))} for item in memories],
+            ],
+            budget_chars=int(kwargs.pop("budget_chars", self.config.memory_policy.compression_budget_chars)),
+            diversity_lambda=self.config.memory_policy.diversity_lambda,
+        )
+        now = utcnow_iso()
+        metadata = dict(kwargs.pop("metadata", {}) or {})
+        payload = {
+            "session": session,
+            "turns": turns,
+            "snapshots": snapshots,
+            "memories": memories,
+            "compression": compression.as_dict(),
+        }
+        stored = self.object_store.put_text(json_dumps(payload), object_type="archive", suffix=".json")
+        object_row = self._persist_object(stored, mime_type="application/json", metadata={"session_id": session_id, **metadata})
+        archive_id = make_id("arch")
+        self.db.execute(
+            """
+            INSERT INTO archive_units(id, domain, source_id, user_id, session_id, object_id, summary, metadata, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                archive_id,
+                "session",
+                session_id,
+                session.get("user_id"),
+                session_id,
+                object_row["id"],
+                compression.summary,
+                json_dumps(metadata),
+                now,
+            ),
+        )
+        summary_id = make_id("archsum")
+        self.db.execute(
+            """
+            INSERT INTO archive_summaries(id, archive_unit_id, summary, highlights, metadata, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (summary_id, archive_id, compression.summary, json_dumps(compression.highlights), json_dumps(metadata), now),
+        )
+        self._index_archive_summary(
+            {
+                "record_id": summary_id,
+                "archive_unit_id": archive_id,
+                "domain": "session",
+                "user_id": session.get("user_id"),
+                "session_id": session_id,
+                "text": compression.summary,
+                "metadata": {"highlights": compression.highlights, **metadata},
+                "updated_at": now,
+            }
+        )
+        self.db.execute("UPDATE sessions SET status = ?, updated_at = ? WHERE id = ?", ("archived", now, session_id))
+        for item in memories:
+            if item.get("status") == "active":
+                self.db.execute("UPDATE memories SET status = ?, archived_at = ?, updated_at = ? WHERE id = ?", ("archived", now, now, item["id"]))
+                self._delete_memory_index(item["id"])
+        return {
+            "archive": self.get_archive_unit(archive_id),
+            "compression": compression.as_dict(),
+        }
+
+    def get_archive_unit(self, archive_unit_id: str) -> dict[str, Any] | None:
+        archive = _deserialize_row(self.db.fetch_one("SELECT * FROM archive_units WHERE id = ?", (archive_unit_id,)))
+        if archive is None:
+            return None
+        archive["summaries"] = _deserialize_rows(self.db.fetch_all("SELECT * FROM archive_summaries WHERE archive_unit_id = ? ORDER BY created_at DESC", (archive_unit_id,)), ("highlights", "metadata"))
+        return archive
+
+    def search_archive(
+        self,
+        query: str,
+        user_id: str | None = None,
+        session_id: str | None = None,
+        limit: int = 10,
+        threshold: float = 0.0,
+        filters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        rows = self.db.fetch_all(
+            """
+            SELECT asi.*, sic.embedding
+            FROM archive_summary_index asi
+            LEFT JOIN semantic_index_cache sic ON sic.record_id = asi.record_id
+            WHERE (? IS NULL OR asi.user_id = ?) AND (? IS NULL OR asi.session_id = ?)
+            ORDER BY asi.updated_at DESC
+            LIMIT ?
+            """,
+            (user_id, user_id, session_id, session_id, max(limit * 12, self.config.memory_policy.search_scan_limit // 2)),
+        )
+        vector_hits = self._vector_hit_map("archive_summary_index", query, limit=max(limit * 4, 24))
+        ranked = self._rank_rows(
+            query,
+            rows,
+            domain="archive",
+            text_key="text",
+            keywords_getter=lambda row: row.get("keywords") or [],
+            updated_at_key="updated_at",
+            importance_getter=lambda row: 0.6,
+            half_life_days=self.config.memory_policy.archive_half_life_days,
+            threshold=threshold,
+            filters=filters,
+            vector_hits=vector_hits,
+        )
+        return {"results": ranked[:limit]}
+
+    def search_interaction(
+        self,
+        query: str,
+        user_id: str | None = None,
+        session_id: str | None = None,
+        limit: int = 10,
+        threshold: float = 0.0,
+        filters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        sql_filters = ["1 = 1"]
+        params: list[Any] = []
+        if session_id:
+            sql_filters.append("ct.session_id = ?")
+            params.append(session_id)
+        if user_id:
+            sql_filters.append("s.user_id = ?")
+            params.append(user_id)
+        rows = self.db.fetch_all(
+            f"""
+            SELECT ct.id, ct.session_id, ct.role, ct.content AS text, ct.metadata, ct.created_at AS updated_at
+            FROM conversation_turns ct
+            JOIN sessions s ON s.id = ct.session_id
+            WHERE {' AND '.join(sql_filters)}
+            ORDER BY ct.created_at DESC
+            LIMIT ?
+            """,
+            tuple(params + [max(limit * 12, self.config.memory_policy.search_scan_limit // 2)]),
+        )
+        ranked = self._rank_rows(
+            query,
+            rows,
+            domain="interaction",
+            text_key="text",
+            keywords_getter=lambda row: extract_keywords(str(row.get("text") or "")),
+            updated_at_key="updated_at",
+            importance_getter=lambda row: 0.68,
+            half_life_days=self.config.memory_policy.short_term_half_life_days,
+            threshold=threshold,
+            filters=filters,
+            vector_hits={},
+        )
+        snapshot_rows = self.db.fetch_all(
+            """
+            SELECT id, session_id, summary AS text, metadata, updated_at
+            FROM working_memory_snapshots
+            WHERE (? IS NULL OR session_id = ?)
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (session_id, session_id, max(limit * 6, 12)),
+        )
+        ranked.extend(
+            self._rank_rows(
+                query,
+                snapshot_rows,
+                domain="interaction",
+                text_key="text",
+                keywords_getter=lambda row: extract_keywords(str(row.get("text") or "")),
+                updated_at_key="updated_at",
+                importance_getter=lambda row: 0.78,
+                half_life_days=self.config.memory_policy.short_term_half_life_days,
+                threshold=threshold,
+                filters=filters,
+                vector_hits={},
+            )
+        )
+        ranked.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
+        ranked = mmr_rerank(ranked, lambda_value=self.config.memory_policy.diversity_lambda, limit=limit)
+        return {"results": ranked[:limit]}
+
+    def search_execution(
+        self,
+        query: str,
+        user_id: str | None = None,
+        session_id: str | None = None,
+        limit: int = 10,
+        threshold: float = 0.0,
+        filters: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        sql_filters = ["1 = 1"]
+        params: list[Any] = []
+        if user_id:
+            sql_filters.append("user_id = ?")
+            params.append(user_id)
+        if session_id:
+            sql_filters.append("session_id = ?")
+            params.append(session_id)
+        runs = self.db.fetch_all(f"SELECT * FROM runs WHERE {' AND '.join(sql_filters)} ORDER BY updated_at DESC LIMIT 80", tuple(params))
+        prepared: list[dict[str, Any]] = []
+        for run in runs:
+            item = _deserialize_row(run) or dict(run)
+            item["text"] = " ".join(part for part in [str(item.get("goal") or ""), str(item.get("status") or "")] if part)
+            prepared.append(item)
+            observations = self.db.fetch_all("SELECT * FROM observations WHERE run_id = ? ORDER BY created_at DESC LIMIT 12", (run["id"],))
+            for observation in observations:
+                obs_item = _deserialize_row(observation) or dict(observation)
+                obs_item["text"] = str(obs_item.get("content") or "")
+                obs_item["updated_at"] = obs_item.get("created_at")
+                prepared.append(obs_item)
+        ranked = self._rank_rows(
+            query,
+            prepared,
+            domain="execution",
+            text_key="text",
+            keywords_getter=lambda row: extract_keywords(str(row.get("text") or "")),
+            updated_at_key="updated_at",
+            importance_getter=lambda row: 0.66,
+            half_life_days=self.config.memory_policy.archive_half_life_days,
+            threshold=threshold,
+            filters=filters,
+            vector_hits={},
+        )
+        return {"results": ranked[:limit]}
 
     def promote_session_memories(self, session_id: str, **kwargs) -> dict[str, Any]:
-        return self.memory.promote_session_memories(session_id=session_id, **kwargs)
+        session = self.get_session(session_id)
+        if session is None:
+            raise ValueError(f"Session `{session_id}` does not exist.")
+        turns = self._session_turns(session_id)
+        recent_long_term = self.memory_list(user_id=session["user_id"], scope=str(MemoryScope.LONG_TERM), limit=60)["results"]
+        background = [item["text"] for item in recent_long_term]
+        messages = self._normalize_messages([{"role": item["role"], "content": item["content"], "metadata": item.get("metadata", {})} for item in turns])
+        candidates = self.distiller.distill(messages, background_texts=background, memory_type=str(kwargs.pop("memory_type", str(MemoryType.SEMANTIC))))
+        threshold = float(kwargs.pop("threshold", self.config.memory_policy.short_term_capture_threshold))
+        created: list[dict[str, Any]] = []
+        for candidate in candidates:
+            if candidate.score < threshold:
+                continue
+            stored = self._remember(
+                candidate.text,
+                user_id=session["user_id"],
+                agent_id=session.get("agent_id"),
+                session_id=session_id,
+                metadata={"promoted_from_session": session_id, **candidate.metadata},
+                memory_type=candidate.memory_type,
+                importance=max(0.35, candidate.score),
+                long_term=True,
+                source="session_promotion",
+            )
+            created.append(stored)
+        return {"results": created}
 
     def compress_session_context(self, session_id: str, **kwargs) -> dict[str, Any]:
-        return self.interaction.compress_session_context(session_id=session_id, **kwargs)
+        turns = self._session_turns(session_id)
+        if len(turns) < self.config.memory_policy.compression_turn_threshold:
+            return {"snapshot": None, "compressed": False, "turn_count": len(turns)}
+        preserve_recent = int(kwargs.pop("preserve_recent_turns", self.config.memory_policy.compression_preserve_recent_turns))
+        budget_chars = int(kwargs.pop("budget_chars", self.config.memory_policy.compression_budget_chars))
+        older_turns = turns[:-preserve_recent] if preserve_recent < len(turns) else []
+        compression = compress_records(
+            [{"id": item["id"], "text": item["content"], "score": 0.42 + min(0.36, len(item["content"]) / 520.0)} for item in older_turns],
+            budget_chars=budget_chars,
+            diversity_lambda=self.config.memory_policy.diversity_lambda,
+        )
+        snapshot_id = make_id("snap")
+        now = utcnow_iso()
+        self.db.execute(
+            """
+            INSERT INTO working_memory_snapshots(id, session_id, run_id, summary, plan, scratchpad, window_size, metadata, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot_id,
+                session_id,
+                kwargs.pop("run_id", None),
+                compression.summary,
+                None,
+                None,
+                len(turns),
+                json_dumps({"highlights": compression.highlights, "kept_ids": compression.kept_ids}),
+                now,
+                now,
+            ),
+        )
+        return {"snapshot": self.get_snapshot(snapshot_id), "compressed": True, "turn_count": len(turns)}
+
+    def get_snapshot(self, snapshot_id: str) -> dict[str, Any] | None:
+        return _deserialize_row(self.db.fetch_one("SELECT * FROM working_memory_snapshots WHERE id = ?", (snapshot_id,)))
 
     def session_health(self, session_id: str) -> dict[str, Any]:
-        return self.interaction.session_health(session_id)
+        turns = self._session_turns(session_id)
+        snapshots = _deserialize_rows(self.db.fetch_all("SELECT * FROM working_memory_snapshots WHERE session_id = ? ORDER BY updated_at DESC", (session_id,)))
+        memories = self.memory_list(session_id=session_id, scope=str(MemoryScope.SESSION), limit=200)["results"]
+        latest_snapshot = snapshots[0] if snapshots else None
+        recent_text = "\n".join(item["content"] for item in turns[-self.config.memory_policy.compression_preserve_recent_turns :])
+        return {
+            "session_id": session_id,
+            "turn_count": len(turns),
+            "snapshot_count": len(snapshots),
+            "session_memory_count": len(memories),
+            "estimated_recent_tokens": estimate_tokens(recent_text),
+            "needs_compaction": len(turns) >= self.config.memory_policy.compression_turn_threshold,
+            "latest_snapshot": latest_snapshot,
+        }
 
     def prune_session_snapshots(self, session_id: str, **kwargs) -> dict[str, Any]:
-        return self.interaction.prune_snapshots(session_id=session_id, **kwargs)
+        keep_recent = int(kwargs.pop("keep_recent", self.config.memory_policy.snapshot_keep_recent))
+        snapshots = self.db.fetch_all("SELECT id FROM working_memory_snapshots WHERE session_id = ? ORDER BY updated_at DESC", (session_id,))
+        removed = 0
+        for item in snapshots[keep_recent:]:
+            self.db.execute("DELETE FROM working_memory_snapshots WHERE id = ?", (item["id"],))
+            removed += 1
+        return {"removed": removed, "kept": min(keep_recent, len(snapshots))}
 
     def cleanup_low_value_memories(self, **kwargs) -> dict[str, Any]:
-        return self.cleaner.run_once(**kwargs)
+        limit = int(kwargs.pop("limit", 20))
+        rows = _deserialize_rows(
+            self.db.fetch_all(
+                """
+                SELECT m.*, sic.fingerprint
+                FROM memories m
+                LEFT JOIN semantic_index_cache sic ON sic.record_id = m.id
+                WHERE m.scope = ? AND m.status = 'active'
+                ORDER BY m.updated_at ASC
+                LIMIT ?
+                """,
+                (str(MemoryScope.LONG_TERM), max(limit * 4, 80)),
+            )
+        )
+        archived: list[dict[str, Any]] = []
+        seen: list[dict[str, Any]] = []
+        for row in rows:
+            importance = float(row.get("importance", 0.5) or 0.0)
+            is_weak = importance < self.config.memory_policy.cleanup_importance_threshold
+            is_duplicate = any(
+                semantic_similarity(row.get("text"), existing.get("text")) >= self.config.memory_policy.merge_threshold
+                or hamming_similarity(row.get("fingerprint") or fingerprint(row.get("text")), existing.get("fingerprint") or fingerprint(existing.get("text"))) >= self.config.memory_policy.duplicate_threshold
+                for existing in seen
+            )
+            if is_weak or is_duplicate:
+                archived.append(self.archive_memory(row["id"])["memory"])
+                if len(archived) >= limit:
+                    break
+            else:
+                seen.append(row)
+        return {"results": archived}
 
     def govern_session(self, session_id: str, **kwargs) -> dict[str, Any]:
-        return self.governor.run_once(session_id, **kwargs)
+        return {
+            "session": self.get_session(session_id),
+            "health": self.session_health(session_id),
+            "compression": self.compress_session_context(session_id, **kwargs),
+            "promotion": self.promote_session_memories(session_id, **kwargs),
+            "snapshot_prune": self.prune_session_snapshots(session_id, **kwargs),
+        }
 
     def project(self, limit: int | None = None) -> dict[str, Any]:
-        return self.projection.project_pending(limit=limit)
+        projected = {"memory": 0, "knowledge": 0, "skill": 0, "archive": 0}
+        rows = _deserialize_rows(
+            self.db.fetch_all(
+                "SELECT * FROM memories WHERE status = 'active' ORDER BY updated_at DESC LIMIT ?",
+                (limit or self.config.memory_policy.search_scan_limit,),
+            )
+        )
+        for row in rows:
+            self._index_memory(row)
+            projected["memory"] += 1
+        knowledge_rows = _deserialize_rows(
+            self.db.fetch_all(
+                """
+                SELECT dc.id, dc.document_id, d.source_id, d.title, dc.content, dc.metadata, d.updated_at
+                FROM document_chunks dc
+                JOIN documents d ON d.id = dc.document_id
+                WHERE d.status = 'active'
+                ORDER BY d.updated_at DESC
+                LIMIT ?
+                """,
+                (limit or self.config.memory_policy.search_scan_limit,),
+            )
+        )
+        for row in knowledge_rows:
+            self._index_knowledge_chunk(
+                {
+                    "id": row["id"],
+                    "document_id": row["document_id"],
+                    "source_id": row["source_id"],
+                    "title": row["title"],
+                    "content": row["content"],
+                    "metadata": row.get("metadata", {}),
+                    "updated_at": row["updated_at"],
+                }
+            )
+            projected["knowledge"] += 1
+        skill_rows = _deserialize_rows(
+            self.db.fetch_all(
+                """
+                SELECT sv.id AS record_id, sv.skill_id, sv.version, s.name, s.description, sv.workflow, sv.prompt_template, s.metadata, s.updated_at
+                FROM skill_versions sv
+                JOIN skills s ON s.id = sv.skill_id
+                WHERE s.status = 'active'
+                ORDER BY s.updated_at DESC
+                LIMIT ?
+                """,
+                (limit or self.config.memory_policy.search_scan_limit,),
+            )
+        )
+        for row in skill_rows:
+            combined = "\n".join(part for part in [row["name"], row["description"], row.get("prompt_template"), row.get("workflow")] if part)
+            self._index_skill({**row, "text": combined, "tools": [], "topics": []})
+            projected["skill"] += 1
+        archive_rows = _deserialize_rows(
+            self.db.fetch_all(
+                """
+                SELECT asi.*
+                FROM archive_summary_index asi
+                ORDER BY asi.updated_at DESC
+                LIMIT ?
+                """,
+                (limit or self.config.memory_policy.search_scan_limit,),
+            )
+        )
+        for row in archive_rows:
+            self._index_archive_summary(row)
+            projected["archive"] += 1
+        return {"projected": projected, "vector_backend": getattr(self.vector_index, "name", "sqlite")}
 
     def describe_capabilities(self) -> dict[str, Any]:
-        capabilities = {
-            "llm": getattr(self.llm_provider, "describe_capabilities", lambda: capability_dict(category="llm", provider="unknown", features={}))(),
-            "vision": getattr(self.vision_processor, "describe_capabilities", lambda: capability_dict(category="vision", provider="unknown", features={}))(),
-            "extractor": getattr(self.fact_extractor, "describe_capabilities", lambda: capability_dict(category="extractor", provider="unknown", features={}))(),
-            "planner": getattr(self.memory_planner, "describe_capabilities", lambda: capability_dict(category="planner", provider="unknown", features={}))(),
-            "recall_planner": getattr(self.recall_planner, "describe_capabilities", lambda: capability_dict(category="recall_planner", provider="unknown", features={}))(),
-            "reranker": getattr(self.reranker, "describe_capabilities", lambda: capability_dict(category="reranker", provider="unknown", features={}))(),
-            "index_backend": getattr(self.index_backend, "describe_capabilities", lambda: capability_dict(category="index_backend", provider="unknown", features={}))(),
-            "graph_backend": getattr(self.graph_backend, "describe_capabilities", lambda: capability_dict(category="graph_backend", provider="unknown", features={}))(),
-            "workers": capability_dict(
-                category="workers",
-                provider="built-in",
+        return {
+            "core": capability_dict(
+                category="core",
+                provider="aimemory",
                 features={
-                    "local_workers": True,
-                    "governance_automation": True,
-                    "background_platform": False,
-                },
-                items={
-                    "projector": getattr(self.projector, "describe_capabilities", lambda: capability_dict(category="worker", provider="unknown", features={}))(),
-                    "compactor": getattr(self.compactor, "describe_capabilities", lambda: capability_dict(category="worker", provider="unknown", features={}))(),
-                    "distiller": getattr(self.distiller, "describe_capabilities", lambda: capability_dict(category="worker", provider="unknown", features={}))(),
-                    "cleaner": getattr(self.cleaner, "describe_capabilities", lambda: capability_dict(category="worker", provider="unknown", features={}))(),
-                    "governor": getattr(self.governor, "describe_capabilities", lambda: capability_dict(category="worker", provider="unknown", features={}))(),
+                    "local_only": True,
+                    "llm_required": False,
+                    "portable_storage": True,
+                    "multi_domain_memory": True,
+                    "agent_facing_mcp": True,
                 },
             ),
-            "governance": describe_governance_capabilities(),
-            "memory_type_policy": describe_memory_type_policies(),
+            "embeddings": describe_embedding_runtime(),
+            "vector_index": getattr(self.vector_index, "describe_capabilities", lambda: {})(),
+            "graph_store": getattr(self.graph_store, "describe_capabilities", lambda: {})(),
+            "algorithms": capability_dict(
+                category="algorithms",
+                provider="local-hybrid",
+                features={
+                    "adaptive_distillation": True,
+                    "semantic_deduplication": True,
+                    "hybrid_retrieval": True,
+                    "temporal_decay": True,
+                    "mmr_reranking": True,
+                    "local_context_compression": True,
+                },
+                items={
+                    "policy": asdict(self.config.memory_policy),
+                    "litellm_bridge": self.config.providers.as_litellm_kwargs(),
+                    "embedding_model": self.config.embeddings.as_provider_kwargs(),
+                },
+            ),
+            "mcp": capability_dict(
+                category="mcp",
+                provider="local-adapter",
+                features={
+                    "tool_schema_export": True,
+                    "fastmcp_binding": True,
+                    "service_required": False,
+                },
+                items={
+                    "tools": [item["name"] for item in self.create_mcp_adapter().tool_specs()],
+                    "litellm": self.config.providers.as_litellm_kwargs(),
+                },
+            ),
         }
-        return capabilities
+
+    def create_mcp_adapter(self):
+        from aimemory.mcp.adapter import AIMemoryMCPAdapter
+
+        return AIMemoryMCPAdapter(self)
+
+    def litellm_config(self) -> dict[str, Any]:
+        return self.config.providers.as_litellm_kwargs()
 
     def close(self) -> None:
         if self._closed:
@@ -363,49 +1382,579 @@ class AIMemory:
             normalized["offset"] = max(0, page - 1) * limit
         return normalized
 
+    def _build_context(
+        self,
+        *,
+        user_id: str | None = None,
+        session_id: str | None = None,
+        agent_id: str | None = None,
+        run_id: str | None = None,
+        actor_id: str | None = None,
+        role: str | None = None,
+    ) -> MemoryScopeContext:
+        return MemoryScopeContext(
+            user_id=user_id or self.config.default_user_id,
+            session_id=session_id,
+            agent_id=agent_id,
+            run_id=run_id,
+            actor_id=actor_id,
+            role=role,
+        )
+
+    def _normalize_messages(self, messages: Any) -> list[NormalizedMessage]:
+        normalized = self.normalizer.normalize(messages)
+        return [item for item in normalized if item.content.strip()]
+
+    def _raw_candidates(self, messages: list[NormalizedMessage], *, memory_type: str) -> list[DistilledCandidate]:
+        results: list[DistilledCandidate] = []
+        for item in messages:
+            text = item.content.strip()
+            if not text:
+                continue
+            results.append(
+                DistilledCandidate(
+                    text=text,
+                    score=0.62,
+                    novelty=1.0,
+                    informativeness=0.6,
+                    density=0.6,
+                    length_score=0.6,
+                    fingerprint=fingerprint(text),
+                    embedding=[],
+                    memory_type=memory_type,
+                    metadata={"source_role": item.role, **item.metadata},
+                )
+            )
+        return results
+
+    def _background_texts(self, *, context: MemoryScopeContext, long_term: bool) -> list[str]:
+        scope = str(MemoryScope.LONG_TERM if long_term else MemoryScope.SESSION)
+        filters = ["status = 'active'", "scope = ?"]
+        params: list[Any] = [scope]
+        if context.user_id:
+            filters.append("user_id = ?")
+            params.append(context.user_id)
+        if not long_term and context.session_id:
+            filters.append("session_id = ?")
+            params.append(context.session_id)
+        rows = self.db.fetch_all(
+            f"SELECT text FROM memories WHERE {' AND '.join(filters)} ORDER BY updated_at DESC LIMIT ?",
+            tuple(params + [self.config.memory_policy.background_sample_limit]),
+        )
+        return [str(item.get("text") or "") for item in rows if str(item.get("text") or "").strip()]
+
+    def _remember(
+        self,
+        text: str,
+        *,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        memory_type: str = str(MemoryType.SEMANTIC),
+        importance: float = 0.5,
+        long_term: bool = True,
+        source: str = "manual",
+    ) -> dict[str, Any]:
+        cleaned = text.strip()
+        if not cleaned:
+            raise ValueError("text must not be empty")
+        scope = str(MemoryScope.LONG_TERM if long_term else MemoryScope.SESSION)
+        user_id = user_id or self.config.default_user_id
+        metadata = dict(metadata or {})
+        now = utcnow_iso()
+        existing, relation = self._find_existing_memory(cleaned, user_id=user_id, session_id=session_id, scope=scope)
+        if existing is not None and relation == "duplicate":
+            merged_metadata = merge_metadata(existing.get("metadata"), metadata)
+            new_importance = max(float(existing.get("importance", 0.5) or 0.0), float(importance))
+            self.db.execute(
+                """
+                UPDATE memories
+                SET importance = ?, metadata = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (new_importance, json_dumps(merged_metadata), now, existing["id"]),
+            )
+            self._record_memory_event(existing["id"], "DUPLICATE_TOUCH", {"incoming_text": cleaned})
+            touched = self.get(existing["id"])
+            assert touched is not None
+            self._index_memory(touched)
+            touched["_event"] = "DUPLICATE"
+            return touched
+        if existing is not None and relation == "merge":
+            merged_text = merge_text_fragments([existing["text"], cleaned], max_sentences=6, max_chars=480)
+            merged_summary = build_summary(split_sentences(merged_text), max_sentences=3, max_chars=220)
+            merged_metadata = merge_metadata(existing.get("metadata"), metadata)
+            new_importance = max(float(existing.get("importance", 0.5) or 0.0), float(importance))
+            self.db.execute(
+                """
+                UPDATE memories
+                SET text = ?, summary = ?, importance = ?, metadata = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (merged_text, merged_summary, new_importance, json_dumps(merged_metadata), now, existing["id"]),
+            )
+            self._record_memory_event(existing["id"], "MERGE", {"incoming_text": cleaned})
+            merged = self.get(existing["id"])
+            assert merged is not None
+            self._index_memory(merged)
+            merged["_event"] = "MERGE"
+            return merged
+
+        memory_id = make_id("mem")
+        summary = build_summary(split_sentences(cleaned), max_sentences=3, max_chars=220)
+        self.db.execute(
+            """
+            INSERT INTO memories(id, user_id, agent_id, session_id, run_id, scope, memory_type, text, summary, importance, status, source, metadata, created_at, updated_at, archived_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                memory_id,
+                user_id,
+                agent_id,
+                session_id,
+                run_id,
+                scope,
+                memory_type,
+                cleaned,
+                summary,
+                float(importance),
+                "active",
+                source,
+                json_dumps(metadata),
+                now,
+                now,
+                None,
+            ),
+        )
+        self._record_memory_event(memory_id, "ADD", {"text": cleaned, "scope": scope})
+        created = self.get(memory_id)
+        assert created is not None
+        self._index_memory(created)
+        created["_event"] = "ADD"
+        return created
+
+    def _find_existing_memory(
+        self,
+        text: str,
+        *,
+        user_id: str,
+        session_id: str | None,
+        scope: str,
+    ) -> tuple[dict[str, Any] | None, str | None]:
+        filters = ["m.user_id = ?", "m.scope = ?", "m.status = 'active'"]
+        params: list[Any] = [user_id, scope]
+        if scope == str(MemoryScope.SESSION) and session_id:
+            filters.append("m.session_id = ?")
+            params.append(session_id)
+        rows = _deserialize_rows(
+            self.db.fetch_all(
+                f"""
+                SELECT m.*, sic.fingerprint
+                FROM memories m
+                LEFT JOIN semantic_index_cache sic ON sic.record_id = m.id
+                WHERE {' AND '.join(filters)}
+                ORDER BY m.updated_at DESC
+                LIMIT ?
+                """,
+                tuple(params + [48]),
+            )
+        )
+        current_fingerprint = fingerprint(text)
+        best_duplicate = None
+        best_merge = None
+        duplicate_score = 0.0
+        merge_score = 0.0
+        for row in rows:
+            semantic = semantic_similarity(text, row.get("text"))
+            fp_similarity = hamming_similarity(current_fingerprint, row.get("fingerprint") or fingerprint(row.get("text")))
+            combined = max(semantic, (0.55 * semantic) + (0.45 * fp_similarity))
+            if combined >= self.config.memory_policy.duplicate_threshold and combined > duplicate_score:
+                best_duplicate = row
+                duplicate_score = combined
+            elif combined >= self.config.memory_policy.merge_threshold and combined > merge_score:
+                best_merge = row
+                merge_score = combined
+        if best_duplicate is not None:
+            return best_duplicate, "duplicate"
+        if best_merge is not None:
+            return best_merge, "merge"
+        return None, None
+
+    def _record_memory_event(self, memory_id: str, event_type: str, payload: dict[str, Any]) -> None:
+        self.db.execute(
+            "INSERT INTO memory_events(id, memory_id, event_type, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+            (make_id("mevt"), memory_id, event_type, json_dumps(payload), utcnow_iso()),
+        )
+
+    def _persist_object(self, stored, *, mime_type: str, metadata: dict[str, Any]) -> dict[str, Any]:
+        row = self.db.fetch_one("SELECT * FROM objects WHERE object_key = ?", (stored.object_key,))
+        if row is not None:
+            return _deserialize_row(row) or dict(row)
+        object_id = make_id("obj")
+        now = utcnow_iso()
+        self.db.execute(
+            """
+            INSERT INTO objects(id, object_key, object_type, mime_type, size_bytes, checksum, metadata, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (object_id, stored.object_key, stored.object_type, mime_type, stored.size_bytes, stored.checksum, json_dumps(metadata), now),
+        )
+        row = self.db.fetch_one("SELECT * FROM objects WHERE id = ?", (object_id,))
+        return _deserialize_row(row) or dict(row or {})
+
+    def _index_memory(self, memory: dict[str, Any]) -> None:
+        keywords = extract_keywords(memory["text"])
+        self.db.execute(
+            """
+            INSERT INTO memory_index(record_id, domain, scope, user_id, session_id, text, keywords, score_boost, updated_at, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(record_id) DO UPDATE SET
+                scope = excluded.scope,
+                user_id = excluded.user_id,
+                session_id = excluded.session_id,
+                text = excluded.text,
+                keywords = excluded.keywords,
+                score_boost = excluded.score_boost,
+                updated_at = excluded.updated_at,
+                metadata = excluded.metadata
+            """,
+            (
+                memory["id"],
+                "memory",
+                memory["scope"],
+                memory.get("user_id"),
+                memory.get("session_id"),
+                memory["text"],
+                json_dumps(keywords),
+                round(float(memory.get("importance", 0.5) or 0.0) * 0.08, 6),
+                memory["updated_at"],
+                json_dumps(memory.get("metadata", {})),
+            ),
+        )
+        self._index_semantic_record(
+            collection="memory_index",
+            record_id=memory["id"],
+            domain="memory",
+            text=memory["text"],
+            updated_at=memory["updated_at"],
+            quality=float(memory.get("importance", 0.5) or 0.0),
+            metadata={"memory_type": memory.get("memory_type"), "scope": memory.get("scope"), **dict(memory.get("metadata", {}))},
+            keywords=keywords,
+        )
+        self.graph_store.upsert_node("memory", memory["id"], memory.get("summary") or memory["text"][:120], memory.get("metadata"))
+        self._link_memory_relations(memory)
+
+    def _delete_memory_index(self, memory_id: str) -> None:
+        self.db.execute("DELETE FROM memory_index WHERE record_id = ?", (memory_id,))
+        self.db.execute("DELETE FROM semantic_index_cache WHERE record_id = ?", (memory_id,))
+        self.db.execute("DELETE FROM memory_links WHERE source_memory_id = ? OR target_memory_id = ?", (memory_id, memory_id))
+        self.vector_index.delete("memory_index", memory_id)
+        self.graph_store.delete_reference(memory_id)
+
+    def _index_knowledge_chunk(self, payload: dict[str, Any]) -> None:
+        keywords = extract_keywords(" ".join(part for part in [payload.get("title"), payload.get("content")] if part))
+        self.db.execute(
+            """
+            INSERT INTO knowledge_chunk_index(record_id, document_id, source_id, title, text, keywords, updated_at, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(record_id) DO UPDATE SET
+                document_id = excluded.document_id,
+                source_id = excluded.source_id,
+                title = excluded.title,
+                text = excluded.text,
+                keywords = excluded.keywords,
+                updated_at = excluded.updated_at,
+                metadata = excluded.metadata
+            """,
+            (
+                payload["id"],
+                payload["document_id"],
+                payload.get("source_id"),
+                payload.get("title"),
+                payload["content"],
+                json_dumps(keywords),
+                payload["updated_at"],
+                json_dumps(payload.get("metadata", {})),
+            ),
+        )
+        self._index_semantic_record(
+            collection="knowledge_chunk_index",
+            record_id=payload["id"],
+            domain="knowledge",
+            text=payload["content"],
+            updated_at=payload["updated_at"],
+            quality=0.74,
+            metadata={"document_id": payload["document_id"], "title": payload.get("title"), **dict(payload.get("metadata", {}))},
+            keywords=keywords,
+        )
+        self.graph_store.upsert_node("knowledge", payload["id"], payload.get("title") or payload["content"][:120], payload.get("metadata"))
+
+    def _index_skill(self, payload: dict[str, Any]) -> None:
+        keywords = extract_keywords(payload["text"])
+        self.db.execute(
+            """
+            INSERT INTO skill_index(record_id, skill_id, version, name, description, text, keywords, updated_at, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(record_id) DO UPDATE SET
+                skill_id = excluded.skill_id,
+                version = excluded.version,
+                name = excluded.name,
+                description = excluded.description,
+                text = excluded.text,
+                keywords = excluded.keywords,
+                updated_at = excluded.updated_at,
+                metadata = excluded.metadata
+            """,
+            (
+                payload["record_id"],
+                payload["skill_id"],
+                payload["version"],
+                payload["name"],
+                payload.get("description"),
+                payload["text"],
+                json_dumps(keywords),
+                payload["updated_at"],
+                json_dumps(payload.get("metadata", {})),
+            ),
+        )
+        self._index_semantic_record(
+            collection="skill_index",
+            record_id=payload["record_id"],
+            domain="skill",
+            text=payload["text"],
+            updated_at=payload["updated_at"],
+            quality=0.8,
+            metadata={"skill_id": payload["skill_id"], "version": payload["version"], **dict(payload.get("metadata", {}))},
+            keywords=keywords,
+        )
+        self.graph_store.upsert_node("skill", payload["skill_id"], payload["name"], payload.get("metadata"))
+
+    def _index_archive_summary(self, payload: dict[str, Any]) -> None:
+        keywords = payload.get("keywords") or extract_keywords(payload["text"])
+        self.db.execute(
+            """
+            INSERT INTO archive_summary_index(record_id, archive_unit_id, domain, user_id, session_id, text, keywords, updated_at, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(record_id) DO UPDATE SET
+                archive_unit_id = excluded.archive_unit_id,
+                domain = excluded.domain,
+                user_id = excluded.user_id,
+                session_id = excluded.session_id,
+                text = excluded.text,
+                keywords = excluded.keywords,
+                updated_at = excluded.updated_at,
+                metadata = excluded.metadata
+            """,
+            (
+                payload["record_id"],
+                payload["archive_unit_id"],
+                payload["domain"],
+                payload.get("user_id"),
+                payload.get("session_id"),
+                payload["text"],
+                json_dumps(keywords),
+                payload["updated_at"],
+                json_dumps(payload.get("metadata", {})),
+            ),
+        )
+        self._index_semantic_record(
+            collection="archive_summary_index",
+            record_id=payload["record_id"],
+            domain="archive",
+            text=payload["text"],
+            updated_at=payload["updated_at"],
+            quality=0.62,
+            metadata={"archive_unit_id": payload["archive_unit_id"], **dict(payload.get("metadata", {}))},
+            keywords=list(keywords),
+        )
+        self.graph_store.upsert_node("archive", payload["archive_unit_id"], payload["text"][:120], payload.get("metadata"))
+
+    def _index_semantic_record(
+        self,
+        *,
+        collection: str,
+        record_id: str,
+        domain: str,
+        text: str,
+        updated_at: str,
+        quality: float,
+        metadata: dict[str, Any],
+        keywords: list[str],
+    ) -> None:
+        payload = {
+            "domain": domain,
+            "embedding": json_dumps([] if not text else self._embedding_for_text(text)),
+            "fingerprint": fingerprint(text),
+            "quality": quality,
+            "updated_at": updated_at,
+            "metadata": json_dumps(metadata),
+            "keywords": keywords,
+        }
+        self.vector_index.upsert(collection, record_id, text, payload)
+        if getattr(self.vector_index, "name", "") != "sqlite":
+            self.db.execute(
+                """
+                INSERT INTO semantic_index_cache(record_id, domain, collection, text, embedding, fingerprint, quality, updated_at, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(record_id) DO UPDATE SET
+                    domain = excluded.domain,
+                    collection = excluded.collection,
+                    text = excluded.text,
+                    embedding = excluded.embedding,
+                    fingerprint = excluded.fingerprint,
+                    quality = excluded.quality,
+                    updated_at = excluded.updated_at,
+                    metadata = excluded.metadata
+                """,
+                (
+                    record_id,
+                    domain,
+                    collection,
+                    text,
+                    payload["embedding"],
+                    payload["fingerprint"],
+                    quality,
+                    updated_at,
+                    payload["metadata"],
+                ),
+            )
+
+    def _embedding_for_text(self, text: str) -> list[float]:
+        return embed_text(text, dims=int(self.config.embeddings.dimensions))
+
+    def _link_memory_relations(self, memory: dict[str, Any]) -> None:
+        self.db.execute("DELETE FROM memory_links WHERE source_memory_id = ?", (memory["id"],))
+        candidates = _deserialize_rows(
+            self.db.fetch_all(
+                """
+                SELECT m.id, m.text, sic.fingerprint
+                FROM memories m
+                LEFT JOIN semantic_index_cache sic ON sic.record_id = m.id
+                WHERE m.id != ? AND m.status = 'active' AND m.user_id = ?
+                ORDER BY m.updated_at DESC
+                LIMIT 24
+                """,
+                (memory["id"], memory.get("user_id")),
+            )
+        )
+        relation_count = 0
+        for candidate in candidates:
+            similarity = semantic_similarity(memory.get("text"), candidate.get("text"))
+            if similarity < self.config.memory_policy.relation_threshold:
+                continue
+            self.db.execute(
+                """
+                INSERT INTO memory_links(id, source_memory_id, target_memory_id, link_type, weight, metadata, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (make_id("mlink"), memory["id"], candidate["id"], "semantic", similarity, json_dumps({"score": similarity}), utcnow_iso()),
+            )
+            self.graph_store.upsert_edge("memory", memory["id"], "related_to", "memory", candidate["id"], {"score": similarity})
+            relation_count += 1
+            if relation_count >= 4:
+                break
+
+    def _vector_hit_map(self, collection: str, query: str, *, limit: int) -> dict[str, float]:
+        hits: dict[str, float] = {}
+        for row in self.vector_index.search(collection, query, limit=limit):
+            record_id = str(row.get("record_id") or row.get("id") or "")
+            if not record_id:
+                continue
+            distance = float(row.get("_distance", 1.0) or 1.0)
+            hits[record_id] = max(hits.get(record_id, 0.0), max(0.0, 1.0 - distance))
+        return hits
+
+    def _rank_memory_rows(
+        self,
+        query: str,
+        rows: list[dict[str, Any]],
+        *,
+        half_life_days: float,
+        threshold: float,
+        filters: dict[str, Any] | None,
+        vector_hits: dict[str, float],
+    ) -> list[dict[str, Any]]:
+        ranked = self._rank_rows(
+            query,
+            rows,
+            domain="memory",
+            text_key="text",
+            keywords_getter=lambda row: _loads(row.get("index_keywords"), []),
+            updated_at_key="updated_at",
+            importance_getter=lambda row: float(row.get("importance", 0.5) or 0.0),
+            half_life_days=half_life_days,
+            threshold=threshold,
+            filters=filters,
+            vector_hits=vector_hits,
+        )
+        for item in ranked:
+            item["relations"] = self.graph_store.relations_for_ref(item["id"], limit=6)
+        return ranked
+
+    def _rank_rows(
+        self,
+        query: str,
+        rows: list[dict[str, Any]],
+        *,
+        domain: str,
+        text_key: str,
+        keywords_getter: Callable[[dict[str, Any]], list[str] | str],
+        updated_at_key: str,
+        importance_getter: Callable[[dict[str, Any]], float],
+        half_life_days: float,
+        threshold: float,
+        filters: dict[str, Any] | None,
+        vector_hits: dict[str, float],
+    ) -> list[dict[str, Any]]:
+        ranked: list[dict[str, Any]] = []
+        for row in rows:
+            item = _deserialize_row(row) or dict(row)
+            text = str(item.get(text_key) or "")
+            if not text.strip():
+                continue
+            record_id = str(item.get("record_id") or item.get("id") or "")
+            score, breakdown = score_record(
+                query,
+                text=text,
+                keywords=keywords_getter(item),
+                embedding=item.get("embedding"),
+                updated_at=item.get(updated_at_key),
+                importance=importance_getter(item),
+                boost=vector_hits.get(record_id, 0.0) * 0.16,
+                half_life_days=half_life_days,
+            )
+            if score < threshold:
+                continue
+            item["id"] = record_id or str(item.get("id") or "")
+            item["text"] = text
+            item["score"] = score
+            item["score_breakdown"] = breakdown
+            item["domain"] = domain
+            ranked.append(item)
+        if filters:
+            ranked = filter_records(ranked, filters)
+        ranked.sort(key=lambda item: float(item.get("score", 0.0)), reverse=True)
+        return mmr_rerank(ranked, lambda_value=self.config.memory_policy.diversity_lambda)
+
+    def _session_turns(self, session_id: str) -> list[dict[str, Any]]:
+        return _deserialize_rows(self.db.fetch_all("SELECT * FROM conversation_turns WHERE session_id = ? ORDER BY created_at ASC", (session_id,)))
+
 
 class AsyncAIMemory:
     def __init__(self, config: AIMemoryConfig | dict[str, Any] | None = None):
         self._sync = AIMemory(config)
 
-    async def add(self, messages, **kwargs) -> dict[str, Any]:
-        return await asyncio.to_thread(self._sync.add, messages, **kwargs)
+    def __getattr__(self, name: str):
+        target = getattr(self._sync, name)
+        if not callable(target):
+            return target
 
-    async def search(self, query: str, **kwargs) -> dict[str, Any]:
-        return await asyncio.to_thread(self._sync.search, query, **kwargs)
+        async def wrapper(*args, **kwargs):
+            return await asyncio.to_thread(target, *args, **kwargs)
 
-    async def memory_store(self, text: str, **kwargs) -> dict[str, Any]:
-        return await asyncio.to_thread(self._sync.memory_store, text, **kwargs)
-
-    async def query(self, query: str, **kwargs) -> dict[str, Any]:
-        return await asyncio.to_thread(self._sync.query, query, **kwargs)
-
-    async def get(self, memory_id: str) -> dict[str, Any] | None:
-        return await asyncio.to_thread(self._sync.get, memory_id)
-
-    async def promote_session_memories(self, session_id: str, **kwargs) -> dict[str, Any]:
-        return await asyncio.to_thread(self._sync.promote_session_memories, session_id, **kwargs)
-
-    async def compress_session_context(self, session_id: str, **kwargs) -> dict[str, Any]:
-        return await asyncio.to_thread(self._sync.compress_session_context, session_id, **kwargs)
-
-    async def session_health(self, session_id: str) -> dict[str, Any]:
-        return await asyncio.to_thread(self._sync.session_health, session_id)
-
-    async def prune_session_snapshots(self, session_id: str, **kwargs) -> dict[str, Any]:
-        return await asyncio.to_thread(self._sync.prune_session_snapshots, session_id, **kwargs)
-
-    async def cleanup_low_value_memories(self, **kwargs) -> dict[str, Any]:
-        return await asyncio.to_thread(self._sync.cleanup_low_value_memories, **kwargs)
-
-    async def govern_session(self, session_id: str, **kwargs) -> dict[str, Any]:
-        return await asyncio.to_thread(self._sync.govern_session, session_id, **kwargs)
-
-    async def explain_recall(self, query: str, **kwargs) -> dict[str, Any]:
-        return await asyncio.to_thread(self._sync.explain_recall, query, **kwargs)
-
-    async def describe_capabilities(self) -> dict[str, Any]:
-        return await asyncio.to_thread(self._sync.describe_capabilities)
+        return wrapper
 
     async def close(self) -> None:
         await asyncio.to_thread(self._sync.close)

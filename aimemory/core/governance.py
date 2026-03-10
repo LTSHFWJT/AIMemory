@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from aimemory.algorithms.affinity import STRATEGY_SCOPE_PROTOTYPES, best_label, blend_score_maps, prototype_affinities
 from aimemory.core.capabilities import capability_dict
 from aimemory.domains.memory.models import MemoryType
 
@@ -10,20 +11,6 @@ from aimemory.domains.memory.models import MemoryType
 USER_SCOPE = "user"
 AGENT_SCOPE = "agent"
 RUN_SCOPE = "run"
-
-EXECUTION_CUES = (
-    "run",
-    "task",
-    "checkpoint",
-    "step",
-    "执行",
-    "步骤",
-    "任务",
-    "本次 run",
-    "当前 run",
-    "刚完成",
-    "完成了",
-)
 
 
 def _clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
@@ -45,35 +32,25 @@ def resolve_strategy_scope(
         return str(explicit)
 
     normalized_type = str(memory_type or MemoryType.SEMANTIC)
-    text_lower = str(text or metadata.get("source_text") or "").lower()
     source_role = str(metadata.get("source_role") or role or "").lower()
+    type_bias: dict[str, float] = {
+        USER_SCOPE: 0.18 if normalized_type in {str(MemoryType.PREFERENCE), str(MemoryType.PROFILE), str(MemoryType.RELATIONSHIP_SUMMARY)} else 0.0,
+        AGENT_SCOPE: 0.18 if normalized_type == str(MemoryType.PROCEDURAL) else 0.0,
+        RUN_SCOPE: 0.18 if normalized_type == str(MemoryType.EPISODIC) else 0.0,
+    }
+    context_bias = {
+        USER_SCOPE: 0.04,
+        AGENT_SCOPE: 0.08 if agent_id else 0.0,
+        RUN_SCOPE: 0.08 if run_id else 0.0,
+    }
+    if source_role == "assistant" or metadata.get("source") == "skill":
+        context_bias[AGENT_SCOPE] += 0.08
+    if metadata.get("source") in {"execution", "checkpoint", "run"}:
+        context_bias[RUN_SCOPE] += 0.1
 
-    if normalized_type in {
-        str(MemoryType.PREFERENCE),
-        str(MemoryType.PROFILE),
-        str(MemoryType.RELATIONSHIP_SUMMARY),
-    }:
-        return USER_SCOPE
-
-    if run_id and (
-        normalized_type == str(MemoryType.EPISODIC)
-        or any(cue in text_lower for cue in EXECUTION_CUES)
-        or metadata.get("source") in {"execution", "checkpoint", "run"}
-    ):
-        return RUN_SCOPE
-
-    if agent_id and (
-        normalized_type == str(MemoryType.PROCEDURAL)
-        or source_role == "assistant"
-        or role == "assistant"
-        or metadata.get("source") == "skill"
-    ):
-        return AGENT_SCOPE
-
-    if run_id and normalized_type == str(MemoryType.PROCEDURAL):
-        return AGENT_SCOPE
-
-    return USER_SCOPE
+    text_scores = prototype_affinities(str(text or metadata.get("source_text") or ""), STRATEGY_SCOPE_PROTOTYPES, dense_weight=0.78, sparse_weight=0.18, containment_weight=0.04)
+    combined = blend_score_maps(text_scores, type_bias, context_bias)
+    return best_label(combined, default=USER_SCOPE)
 
 
 def governance_scope_profile(strategy_scope: str) -> dict[str, float]:
@@ -297,8 +274,8 @@ def describe_governance_capabilities() -> dict[str, Any]:
         features={
             "scope_policies": True,
             "memory_type_policies": True,
-            "promotion_rules": True,
-            "cleanup_rules": True,
+            "promotion_policy": True,
+            "cleanup_policy": True,
             "session_governance": True,
             "background_platform": False,
         },
