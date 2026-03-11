@@ -58,6 +58,20 @@ class SQLiteDatabase:
                 self._connection.execute(statement)
             self._connection.commit()
 
+    def table_columns(self, table_name: str) -> set[str]:
+        with self._lock:
+            cursor = self._connection.execute(f"PRAGMA table_info({table_name})")
+            return {str(row[1]) for row in cursor.fetchall()}
+
+    def ensure_columns(self, table_name: str, columns: dict[str, str]) -> None:
+        with self._lock:
+            existing = self.table_columns(table_name)
+            for column_name, definition in columns.items():
+                if column_name in existing:
+                    continue
+                self._connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
+            self._connection.commit()
+
     def close(self) -> None:
         with self._lock:
             if self._closed:

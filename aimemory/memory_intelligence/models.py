@@ -16,6 +16,10 @@ class MemoryActionType(StrEnum):
 class MemoryScopeContext:
     user_id: str | None = None
     agent_id: str | None = None
+    owner_agent_id: str | None = None
+    subject_type: str | None = None
+    subject_id: str | None = None
+    interaction_type: str | None = None
     session_id: str | None = None
     run_id: str | None = None
     actor_id: str | None = None
@@ -27,6 +31,10 @@ class MemoryScopeContext:
             for key, value in {
                 "user_id": self.user_id,
                 "agent_id": self.agent_id,
+                "owner_agent_id": self.owner_agent_id,
+                "subject_type": self.subject_type,
+                "subject_id": self.subject_id,
+                "interaction_type": self.interaction_type,
                 "session_id": self.session_id,
                 "run_id": self.run_id,
                 "actor_id": self.actor_id,
@@ -39,6 +47,10 @@ class MemoryScopeContext:
         payload = {
             "user_id": self.user_id,
             "agent_id": self.agent_id,
+            "owner_agent_id": self.owner_agent_id,
+            "subject_type": self.subject_type,
+            "subject_id": self.subject_id,
+            "interaction_type": self.interaction_type,
             "session_id": self.session_id,
             "run_id": self.run_id,
             "actor_id": self.actor_id,
