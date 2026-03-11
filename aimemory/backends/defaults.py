@@ -24,11 +24,15 @@ class SQLiteIndexBackend:
         keywords = payload.get("keywords") or extract_keywords(payload.get("text"))
         self.db.execute(
             """
-            INSERT INTO memory_index(record_id, domain, scope, user_id, session_id, text, keywords, score_boost, updated_at, metadata)
-            VALUES (?, 'memory', ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO memory_index(record_id, domain, scope, user_id, owner_agent_id, subject_type, subject_id, interaction_type, session_id, text, keywords, score_boost, updated_at, metadata)
+            VALUES (?, 'memory', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(record_id) DO UPDATE SET
                 scope = excluded.scope,
                 user_id = excluded.user_id,
+                owner_agent_id = excluded.owner_agent_id,
+                subject_type = excluded.subject_type,
+                subject_id = excluded.subject_id,
+                interaction_type = excluded.interaction_type,
                 session_id = excluded.session_id,
                 text = excluded.text,
                 keywords = excluded.keywords,
@@ -40,6 +44,10 @@ class SQLiteIndexBackend:
                 record_id,
                 payload["scope"],
                 payload.get("user_id"),
+                payload.get("owner_agent_id"),
+                payload.get("subject_type"),
+                payload.get("subject_id"),
+                payload.get("interaction_type"),
                 payload.get("session_id"),
                 payload.get("text", ""),
                 json_dumps(keywords),
@@ -113,11 +121,14 @@ class SQLiteIndexBackend:
         keywords = payload.get("keywords") or extract_keywords(payload.get("text"))
         self.db.execute(
             """
-            INSERT INTO knowledge_chunk_index(record_id, document_id, source_id, title, text, keywords, updated_at, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO knowledge_chunk_index(record_id, document_id, source_id, owner_agent_id, source_subject_type, source_subject_id, title, text, keywords, updated_at, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(record_id) DO UPDATE SET
                 document_id = excluded.document_id,
                 source_id = excluded.source_id,
+                owner_agent_id = excluded.owner_agent_id,
+                source_subject_type = excluded.source_subject_type,
+                source_subject_id = excluded.source_subject_id,
                 title = excluded.title,
                 text = excluded.text,
                 keywords = excluded.keywords,
@@ -128,6 +139,9 @@ class SQLiteIndexBackend:
                 record_id,
                 payload["document_id"],
                 payload.get("source_id"),
+                payload.get("owner_agent_id"),
+                payload.get("source_subject_type"),
+                payload.get("source_subject_id"),
                 payload.get("title"),
                 payload.get("text", ""),
                 json_dumps(keywords),
@@ -160,11 +174,14 @@ class SQLiteIndexBackend:
         keywords = payload.get("keywords") or extract_keywords(payload.get("text"))
         self.db.execute(
             """
-            INSERT INTO skill_index(record_id, skill_id, version, name, description, text, keywords, updated_at, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO skill_index(record_id, skill_id, version, owner_agent_id, source_subject_type, source_subject_id, name, description, text, keywords, updated_at, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(record_id) DO UPDATE SET
                 skill_id = excluded.skill_id,
                 version = excluded.version,
+                owner_agent_id = excluded.owner_agent_id,
+                source_subject_type = excluded.source_subject_type,
+                source_subject_id = excluded.source_subject_id,
                 name = excluded.name,
                 description = excluded.description,
                 text = excluded.text,
@@ -176,6 +193,9 @@ class SQLiteIndexBackend:
                 record_id,
                 payload["skill_id"],
                 payload.get("version", "1.0.0"),
+                payload.get("owner_agent_id"),
+                payload.get("source_subject_type"),
+                payload.get("source_subject_id"),
                 payload["name"],
                 payload.get("description"),
                 payload.get("text", ""),
@@ -209,12 +229,17 @@ class SQLiteIndexBackend:
         keywords = payload.get("keywords") or extract_keywords(payload.get("text"))
         self.db.execute(
             """
-            INSERT INTO archive_summary_index(record_id, archive_unit_id, domain, user_id, session_id, text, keywords, updated_at, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO archive_summary_index(record_id, archive_unit_id, domain, user_id, owner_agent_id, subject_type, subject_id, interaction_type, source_type, session_id, text, keywords, updated_at, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(record_id) DO UPDATE SET
                 archive_unit_id = excluded.archive_unit_id,
                 domain = excluded.domain,
                 user_id = excluded.user_id,
+                owner_agent_id = excluded.owner_agent_id,
+                subject_type = excluded.subject_type,
+                subject_id = excluded.subject_id,
+                interaction_type = excluded.interaction_type,
+                source_type = excluded.source_type,
                 session_id = excluded.session_id,
                 text = excluded.text,
                 keywords = excluded.keywords,
@@ -226,6 +251,11 @@ class SQLiteIndexBackend:
                 payload["archive_unit_id"],
                 payload["domain"],
                 payload.get("user_id"),
+                payload.get("owner_agent_id"),
+                payload.get("subject_type"),
+                payload.get("subject_id"),
+                payload.get("interaction_type"),
+                payload.get("source_type"),
                 payload.get("session_id"),
                 payload.get("text", ""),
                 json_dumps(keywords),

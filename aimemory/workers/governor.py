@@ -20,6 +20,10 @@ class GovernanceAutomationWorker:
         *,
         user_id: str | None = None,
         agent_id: str | None = None,
+        owner_agent_id: str | None = None,
+        subject_type: str | None = None,
+        subject_id: str | None = None,
+        interaction_type: str | None = None,
         run_id: str | None = None,
         compact: bool = True,
         promote: bool = True,
@@ -37,32 +41,45 @@ class GovernanceAutomationWorker:
         before = self.assess_session(session_id)
         session = self.interaction_service.get_session(session_id) or {}
         effective_user_id = user_id or session.get("user_id")
-        effective_agent_id = agent_id or session.get("agent_id")
+        effective_agent_id = agent_id or session.get("agent_id") or session.get("owner_agent_id")
+        effective_owner_agent_id = owner_agent_id or session.get("owner_agent_id") or session.get("agent_id") or effective_agent_id
+        effective_subject_type = subject_type or session.get("subject_type")
+        effective_subject_id = subject_id or session.get("subject_id")
+        effective_interaction_type = interaction_type or session.get("interaction_type")
+        recommendations = list(before.get("recommendations", []))
 
         result: dict[str, object] = {
             "session_id": session_id,
+            "owner_agent_id": effective_owner_agent_id,
+            "subject_type": effective_subject_type,
+            "subject_id": effective_subject_id,
+            "interaction_type": effective_interaction_type,
             "health_before": before,
             "actions": [],
         }
 
-        if compact and (force or "compact" in before["recommendations"]):
-            result["compaction"] = self.interaction_service.compress_session_context(
-                session_id=session_id,
-                **dict(compaction_kwargs or {}),
-            )
+        if compact and (force or "compact" in recommendations):
+            compaction_args = dict(compaction_kwargs or {})
+            compaction_args.setdefault("owner_agent_id", effective_owner_agent_id)
+            compaction_args.setdefault("subject_type", effective_subject_type)
+            compaction_args.setdefault("subject_id", effective_subject_id)
+            compaction_args.setdefault("interaction_type", effective_interaction_type)
+            result["compaction"] = self.interaction_service.compress_session_context(session_id=session_id, **compaction_args)
             result["actions"].append("compact")
 
-        if promote and (force or "promote" in before["recommendations"]):
-            result["promotion"] = self.memory_service.promote_session_memories(
-                session_id=session_id,
-                user_id=effective_user_id,
-                agent_id=effective_agent_id,
-                run_id=run_id,
-                **dict(promotion_kwargs or {}),
-            )
+        if promote and (force or "promote" in recommendations):
+            promotion_args = dict(promotion_kwargs or {})
+            promotion_args.setdefault("user_id", effective_user_id)
+            promotion_args.setdefault("agent_id", effective_agent_id)
+            promotion_args.setdefault("owner_agent_id", effective_owner_agent_id)
+            promotion_args.setdefault("subject_type", effective_subject_type)
+            promotion_args.setdefault("subject_id", effective_subject_id)
+            promotion_args.setdefault("interaction_type", effective_interaction_type)
+            promotion_args.setdefault("run_id", run_id)
+            result["promotion"] = self.memory_service.promote_session_memories(session_id=session_id, **promotion_args)
             result["actions"].append("promote")
 
-        if prune_snapshots and (force or "prune_snapshots" in before["recommendations"]):
+        if prune_snapshots and (force or "prune_snapshots" in recommendations):
             result["snapshot_prune"] = self.interaction_service.prune_snapshots(
                 session_id=session_id,
                 **dict(prune_kwargs or {}),
@@ -70,15 +87,18 @@ class GovernanceAutomationWorker:
             result["actions"].append("prune_snapshots")
 
         if cleanup:
-            result["cleanup"] = self.cleaner_worker.run_once(
-                user_id=effective_user_id,
-                agent_id=effective_agent_id,
-                run_id=run_id,
-                scope=cleanup_scope,
-                threshold=cleanup_threshold,
-                dry_run=cleanup_dry_run,
-                **dict(cleanup_kwargs or {}),
-            )
+            cleanup_args = dict(cleanup_kwargs or {})
+            cleanup_args.setdefault("user_id", effective_user_id)
+            cleanup_args.setdefault("agent_id", effective_agent_id)
+            cleanup_args.setdefault("owner_agent_id", effective_owner_agent_id)
+            cleanup_args.setdefault("subject_type", effective_subject_type)
+            cleanup_args.setdefault("subject_id", effective_subject_id)
+            cleanup_args.setdefault("interaction_type", effective_interaction_type)
+            cleanup_args.setdefault("run_id", run_id)
+            cleanup_args.setdefault("scope", cleanup_scope)
+            cleanup_args.setdefault("threshold", cleanup_threshold)
+            cleanup_args.setdefault("dry_run", cleanup_dry_run)
+            result["cleanup"] = self.cleaner_worker.run_once(**cleanup_args)
             result["actions"].append("cleanup")
 
         result["health_after"] = self.assess_session(session_id)

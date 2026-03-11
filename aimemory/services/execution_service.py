@@ -10,23 +10,30 @@ from aimemory.services.base import ServiceBase
 class ExecutionService(ServiceBase):
     def start_run(
         self,
-        user_id: str,
+        user_id: str | None,
         goal: str,
         session_id: str | None = None,
         run_id: str | None = None,
         agent_id: str | None = None,
+        owner_agent_id: str | None = None,
+        subject_type: str | None = None,
+        subject_id: str | None = None,
+        interaction_type: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        run_id = run_id or make_id("run")
-        now = utcnow_iso()
-        self.db.execute(
-            """
-            INSERT INTO runs(id, session_id, user_id, agent_id, goal, status, metadata, started_at, ended_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (run_id, session_id, user_id, agent_id, goal, str(RunStatus.RUNNING), json_dumps(metadata or {}), now, None, now),
+        return self._kernel().start_run(
+            user_id=user_id,
+            goal=goal,
+            session_id=session_id,
+            run_id=run_id,
+            agent_id=agent_id,
+            owner_agent_id=owner_agent_id or agent_id,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            interaction_type=interaction_type,
+            metadata=metadata,
+            status=str(RunStatus.RUNNING),
         )
-        return self.get_run(run_id)
 
     def get_run(self, run_id: str) -> dict[str, Any] | None:
         return self._deserialize_row(self.db.fetch_one("SELECT * FROM runs WHERE id = ?", (run_id,)))

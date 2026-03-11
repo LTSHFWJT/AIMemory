@@ -4,6 +4,7 @@ ADDITIONAL_COLUMNS: dict[str, dict[str, str]] = {
         "interaction_type": "TEXT",
         "subject_type": "TEXT",
         "subject_id": "TEXT",
+        "namespace_key": "TEXT",
     },
     "conversation_turns": {
         "speaker_participant_id": "TEXT",
@@ -23,12 +24,14 @@ ADDITIONAL_COLUMNS: dict[str, dict[str, str]] = {
         "budget_tokens": "INTEGER",
         "salience_vector": "TEXT",
         "compression_revision": "INTEGER NOT NULL DEFAULT 1",
+        "namespace_key": "TEXT",
     },
     "runs": {
         "owner_agent_id": "TEXT",
         "interaction_type": "TEXT",
         "subject_type": "TEXT",
         "subject_id": "TEXT",
+        "namespace_key": "TEXT",
     },
     "memories": {
         "owner_agent_id": "TEXT",
@@ -37,6 +40,7 @@ ADDITIONAL_COLUMNS: dict[str, dict[str, str]] = {
         "interaction_type": "TEXT",
         "source_session_id": "TEXT",
         "source_run_id": "TEXT",
+        "namespace_key": "TEXT",
     },
     "documents": {
         "owner_agent_id": "TEXT",
@@ -46,6 +50,7 @@ ADDITIONAL_COLUMNS: dict[str, dict[str, str]] = {
         "retrieval_count": "INTEGER NOT NULL DEFAULT 0",
         "last_retrieved_at": "TEXT",
         "credibility_score": "REAL NOT NULL DEFAULT 0.5",
+        "namespace_key": "TEXT",
     },
     "skills": {
         "owner_agent_id": "TEXT",
@@ -56,6 +61,7 @@ ADDITIONAL_COLUMNS: dict[str, dict[str, str]] = {
         "success_score": "REAL NOT NULL DEFAULT 0.5",
         "capability_tags": "TEXT",
         "tool_affinity": "TEXT",
+        "namespace_key": "TEXT",
     },
     "archive_units": {
         "owner_agent_id": "TEXT",
@@ -67,22 +73,26 @@ ADDITIONAL_COLUMNS: dict[str, dict[str, str]] = {
         "retention_tier": "TEXT",
         "rehydrate_cost": "REAL",
         "last_rehydrated_at": "TEXT",
+        "namespace_key": "TEXT",
     },
     "memory_index": {
         "owner_agent_id": "TEXT",
         "subject_type": "TEXT",
         "subject_id": "TEXT",
         "interaction_type": "TEXT",
+        "namespace_key": "TEXT",
     },
     "knowledge_chunk_index": {
         "owner_agent_id": "TEXT",
         "source_subject_type": "TEXT",
         "source_subject_id": "TEXT",
+        "namespace_key": "TEXT",
     },
     "skill_index": {
         "owner_agent_id": "TEXT",
         "source_subject_type": "TEXT",
         "source_subject_id": "TEXT",
+        "namespace_key": "TEXT",
     },
     "archive_summary_index": {
         "owner_agent_id": "TEXT",
@@ -90,6 +100,7 @@ ADDITIONAL_COLUMNS: dict[str, dict[str, str]] = {
         "subject_id": "TEXT",
         "interaction_type": "TEXT",
         "source_type": "TEXT",
+        "namespace_key": "TEXT",
     },
 }
 
@@ -138,13 +149,22 @@ POST_MIGRATION_SCHEMA_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_semantic_index_domain ON semantic_index_cache(domain, updated_at)",
     "CREATE INDEX IF NOT EXISTS idx_semantic_index_collection ON semantic_index_cache(collection, updated_at)",
     "CREATE INDEX IF NOT EXISTS idx_sessions_owner_subject ON sessions(owner_agent_id, subject_type, subject_id, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_sessions_namespace ON sessions(namespace_key, updated_at)",
     "CREATE INDEX IF NOT EXISTS idx_turns_speaker ON conversation_turns(session_id, speaker_participant_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_memories_owner_subject ON memories(owner_agent_id, subject_type, subject_id, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_memories_namespace ON memories(namespace_key, updated_at)",
     "CREATE INDEX IF NOT EXISTS idx_documents_owner ON documents(owner_agent_id, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_documents_namespace ON documents(namespace_key, updated_at)",
     "CREATE INDEX IF NOT EXISTS idx_skills_owner ON skills(owner_agent_id, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_skills_namespace ON skills(namespace_key, updated_at)",
     "CREATE INDEX IF NOT EXISTS idx_archive_owner ON archive_units(owner_agent_id, subject_type, subject_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_archive_namespace ON archive_units(namespace_key, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_memory_index_owner ON memory_index(owner_agent_id, subject_type, subject_id, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_memory_index_namespace ON memory_index(namespace_key, updated_at)",
     "CREATE INDEX IF NOT EXISTS idx_knowledge_index_owner ON knowledge_chunk_index(owner_agent_id, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_knowledge_index_namespace ON knowledge_chunk_index(namespace_key, updated_at)",
     "CREATE INDEX IF NOT EXISTS idx_skill_index_owner ON skill_index(owner_agent_id, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_skill_index_namespace ON skill_index(namespace_key, updated_at)",
     "CREATE INDEX IF NOT EXISTS idx_archive_index_owner ON archive_summary_index(owner_agent_id, subject_type, subject_id, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_archive_index_namespace ON archive_summary_index(namespace_key, updated_at)",
 ]

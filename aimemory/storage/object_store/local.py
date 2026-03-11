@@ -11,9 +11,9 @@ class LocalObjectStore:
         self.base_path = Path(base_path).expanduser().resolve()
         self.base_path.mkdir(parents=True, exist_ok=True)
 
-    def put_bytes(self, content: bytes, object_type: str, suffix: str = ".bin") -> StoredObject:
+    def put_bytes(self, content: bytes, object_type: str, suffix: str = ".bin", prefix: str | None = None) -> StoredObject:
         checksum = hashlib.sha256(content).hexdigest()
-        relative = Path(object_type) / checksum[:2] / f"{checksum}{suffix}"
+        relative = Path(prefix) / object_type / checksum[:2] / f"{checksum}{suffix}" if prefix else Path(object_type) / checksum[:2] / f"{checksum}{suffix}"
         target = self.base_path / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         if not target.exists():
@@ -26,8 +26,8 @@ class LocalObjectStore:
             path=str(target),
         )
 
-    def put_text(self, text: str, object_type: str, suffix: str = ".txt") -> StoredObject:
-        return self.put_bytes(text.encode("utf-8"), object_type=object_type, suffix=suffix)
+    def put_text(self, text: str, object_type: str, suffix: str = ".txt", prefix: str | None = None) -> StoredObject:
+        return self.put_bytes(text.encode("utf-8"), object_type=object_type, suffix=suffix, prefix=prefix)
 
     def get_bytes(self, object_key: str) -> bytes:
         return (self.base_path / object_key).read_bytes()

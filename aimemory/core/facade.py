@@ -10,6 +10,7 @@ from aimemory.algorithms.distill import AdaptiveDistiller, DistilledCandidate
 from aimemory.algorithms.retrieval import estimate_tokens, mmr_rerank, score_record
 from aimemory.backends.registry import BACKEND_REGISTRY
 from aimemory.core.capabilities import capability_dict
+from aimemory.core.scope import CollaborationScope
 from aimemory.core.settings import AIMemoryConfig
 from aimemory.core.text import build_summary, chunk_text, extract_keywords, split_sentences
 from aimemory.core.utils import json_dumps, json_loads, make_id, merge_metadata, utcnow_iso
@@ -209,6 +210,11 @@ class AIMemory:
             subject_type=kwargs.pop("subject_type", None),
             subject_id=kwargs.pop("subject_id", None),
             interaction_type=kwargs.pop("interaction_type", None),
+            platform_id=kwargs.pop("platform_id", None),
+            workspace_id=kwargs.pop("workspace_id", None),
+            team_id=kwargs.pop("team_id", None),
+            project_id=kwargs.pop("project_id", None),
+            namespace_key=kwargs.pop("namespace_key", None),
             run_id=kwargs.pop("run_id", None),
             actor_id=kwargs.pop("actor_id", None),
             role=kwargs.pop("role", None),
@@ -237,6 +243,11 @@ class AIMemory:
                 subject_type=context.subject_type,
                 subject_id=context.subject_id,
                 interaction_type=context.interaction_type,
+                platform_id=context.platform_id,
+                workspace_id=context.workspace_id,
+                team_id=context.team_id,
+                project_id=context.project_id,
+                namespace_key=context.namespace_key,
                 session_id=context.session_id,
                 run_id=context.run_id,
                 metadata=merge_metadata(metadata, merge_metadata(candidate.metadata, context.as_metadata())),
@@ -390,6 +401,18 @@ class AIMemory:
         limit = int(kwargs.pop("limit", kwargs.pop("topK", top_k)))
         threshold = float(kwargs.pop("threshold", kwargs.pop("searchThreshold", search_threshold)))
         filters = kwargs.pop("filters", None)
+        namespace_filter = self._namespace_filter_value(
+            user_id=user_id,
+            owner_agent_id=owner_agent_id,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            interaction_type=interaction_type,
+            platform_id=kwargs.pop("platform_id", None),
+            workspace_id=kwargs.pop("workspace_id", None),
+            team_id=kwargs.pop("team_id", None),
+            project_id=kwargs.pop("project_id", None),
+            namespace_key=kwargs.pop("namespace_key", None),
+        )
         sql_filters = ["m.status = 'active'"]
         params: list[Any] = []
         if user_id:
@@ -419,6 +442,9 @@ class AIMemory:
         elif session_id:
             sql_filters.append("(m.scope = ? OR m.session_id = ?)")
             params.extend([str(MemoryScope.LONG_TERM), session_id])
+        if namespace_filter:
+            sql_filters.append("m.namespace_key = ?")
+            params.append(namespace_filter)
 
         rows = self.db.fetch_all(
             f"""
@@ -528,6 +554,11 @@ class AIMemory:
         interaction_type: str | None = None,
         session_id: str | None = None,
         agent_id: str | None = None,
+        platform_id: str | None = None,
+        workspace_id: str | None = None,
+        team_id: str | None = None,
+        project_id: str | None = None,
+        namespace_key: str | None = None,
         run_id: str | None = None,
         actor_id: str | None = None,
         role: str | None = None,
@@ -545,6 +576,11 @@ class AIMemory:
                 subject_id=subject_id,
                 interaction_type=interaction_type,
                 session_id=session_id,
+                platform_id=platform_id,
+                workspace_id=workspace_id,
+                team_id=team_id,
+                project_id=project_id,
+                namespace_key=namespace_key,
                 scope="all",
                 limit=max(limit, self.config.memory_policy.auxiliary_search_limit),
                 threshold=threshold,
@@ -557,6 +593,11 @@ class AIMemory:
                 subject_id=subject_id,
                 interaction_type=interaction_type,
                 session_id=session_id,
+                platform_id=platform_id,
+                workspace_id=workspace_id,
+                team_id=team_id,
+                project_id=project_id,
+                namespace_key=namespace_key,
                 limit=max(limit, self.config.memory_policy.auxiliary_search_limit),
                 threshold=threshold,
             ),
@@ -566,6 +607,11 @@ class AIMemory:
                 owner_agent_id=owner_agent_id or agent_id,
                 subject_type=subject_type,
                 subject_id=subject_id,
+                platform_id=platform_id,
+                workspace_id=workspace_id,
+                team_id=team_id,
+                project_id=project_id,
+                namespace_key=namespace_key,
                 limit=max(limit, self.config.memory_policy.auxiliary_search_limit),
                 threshold=threshold,
             ),
@@ -574,6 +620,11 @@ class AIMemory:
                 owner_agent_id=owner_agent_id or agent_id,
                 subject_type=subject_type,
                 subject_id=subject_id,
+                platform_id=platform_id,
+                workspace_id=workspace_id,
+                team_id=team_id,
+                project_id=project_id,
+                namespace_key=namespace_key,
                 limit=max(limit, self.config.memory_policy.auxiliary_search_limit),
                 threshold=threshold,
             ),
@@ -585,6 +636,11 @@ class AIMemory:
                 subject_id=subject_id,
                 interaction_type=interaction_type,
                 session_id=session_id,
+                platform_id=platform_id,
+                workspace_id=workspace_id,
+                team_id=team_id,
+                project_id=project_id,
+                namespace_key=namespace_key,
                 limit=max(limit, self.config.memory_policy.auxiliary_search_limit),
                 threshold=threshold,
             ),
@@ -593,6 +649,11 @@ class AIMemory:
                 user_id=user_id,
                 owner_agent_id=owner_agent_id or agent_id,
                 session_id=session_id,
+                platform_id=platform_id,
+                workspace_id=workspace_id,
+                team_id=team_id,
+                project_id=project_id,
+                namespace_key=namespace_key,
                 limit=max(limit, self.config.memory_policy.auxiliary_search_limit),
                 threshold=threshold,
             ),
@@ -638,12 +699,17 @@ class AIMemory:
             subject_type=kwargs.pop("subject_type", None),
             subject_id=kwargs.pop("subject_id", None),
             interaction_type=kwargs.pop("interaction_type", None),
+            platform_id=kwargs.pop("platform_id", None),
+            workspace_id=kwargs.pop("workspace_id", None),
+            team_id=kwargs.pop("team_id", None),
+            project_id=kwargs.pop("project_id", None),
+            namespace_key=kwargs.pop("namespace_key", None),
         )
         title = kwargs.pop("title", None)
         self.db.execute(
             """
-            INSERT INTO sessions(id, user_id, agent_id, owner_agent_id, interaction_type, subject_type, subject_id, title, status, metadata, active_window, ttl_seconds, expires_at, last_accessed_at, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO sessions(id, user_id, agent_id, owner_agent_id, interaction_type, subject_type, subject_id, namespace_key, title, status, metadata, active_window, ttl_seconds, expires_at, last_accessed_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -653,6 +719,7 @@ class AIMemory:
                 scope["interaction_type"],
                 scope["subject_type"],
                 scope["subject_id"],
+                scope.get("namespace_key"),
                 title,
                 "active",
                 json_dumps(merge_metadata(metadata, self._scope_metadata(scope))),
@@ -759,6 +826,11 @@ class AIMemory:
                 subject_type=session.get("subject_type"),
                 subject_id=session.get("subject_id"),
                 interaction_type=session.get("interaction_type"),
+                platform_id=session.get("platform_id"),
+                workspace_id=session.get("workspace_id"),
+                team_id=session.get("team_id"),
+                project_id=session.get("project_id"),
+                namespace_key=session.get("namespace_key"),
                 run_id=run_id,
                 long_term=False,
                 source="conversation_turn",
@@ -792,11 +864,16 @@ class AIMemory:
             subject_type=kwargs.pop("subject_type", None),
             subject_id=kwargs.pop("subject_id", None),
             interaction_type=kwargs.pop("interaction_type", None),
+            platform_id=kwargs.pop("platform_id", None),
+            workspace_id=kwargs.pop("workspace_id", None),
+            team_id=kwargs.pop("team_id", None),
+            project_id=kwargs.pop("project_id", None),
+            namespace_key=kwargs.pop("namespace_key", None),
         )
         self.db.execute(
             """
-            INSERT INTO runs(id, session_id, user_id, agent_id, owner_agent_id, interaction_type, subject_type, subject_id, goal, status, metadata, started_at, ended_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO runs(id, session_id, user_id, agent_id, owner_agent_id, interaction_type, subject_type, subject_id, namespace_key, goal, status, metadata, started_at, ended_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 run_id,
@@ -807,6 +884,7 @@ class AIMemory:
                 scope["interaction_type"],
                 scope["subject_type"],
                 scope["subject_id"],
+                scope.get("namespace_key"),
                 goal,
                 kwargs.pop("status", "running"),
                 json_dumps(merge_metadata(kwargs.pop("metadata", {}) or {}, self._scope_metadata(scope))),
@@ -821,15 +899,28 @@ class AIMemory:
         source_name = kwargs.pop("source_name", title)
         source_type = kwargs.pop("source_type", "inline")
         uri = kwargs.pop("uri", None)
-        user_id = kwargs.pop("user_id", None)
-        owner_agent_id = kwargs.pop("owner_agent_id", kwargs.pop("agent_id", None))
-        source_subject_type = kwargs.pop("source_subject_type", kwargs.pop("subject_type", None))
-        source_subject_id = kwargs.pop("source_subject_id", kwargs.pop("subject_id", None))
+        scope = self._resolve_scope(
+            user_id=kwargs.pop("user_id", None),
+            agent_id=kwargs.pop("agent_id", None),
+            owner_agent_id=kwargs.pop("owner_agent_id", None),
+            subject_type=kwargs.pop("source_subject_type", kwargs.pop("subject_type", None)),
+            subject_id=kwargs.pop("source_subject_id", kwargs.pop("subject_id", None)),
+            interaction_type=kwargs.pop("interaction_type", None),
+            platform_id=kwargs.pop("platform_id", None),
+            workspace_id=kwargs.pop("workspace_id", None),
+            team_id=kwargs.pop("team_id", None),
+            project_id=kwargs.pop("project_id", None),
+            namespace_key=kwargs.pop("namespace_key", None),
+        )
+        user_id = scope["user_id"]
+        owner_agent_id = scope["owner_agent_id"]
+        source_subject_type = scope["subject_type"]
+        source_subject_id = scope["subject_id"]
         external_id = kwargs.pop("external_id", None)
         metadata = dict(kwargs.pop("metadata", {}) or {})
         chunk_size = int(kwargs.pop("chunk_size", self.config.memory_policy.chunk_size))
         chunk_overlap = int(kwargs.pop("chunk_overlap", self.config.memory_policy.chunk_overlap))
-        kb_namespace = kwargs.pop("kb_namespace", owner_agent_id or "default")
+        kb_namespace = kwargs.pop("kb_namespace", scope.get("namespace_key") or owner_agent_id or "default")
         now = utcnow_iso()
 
         source = self.db.fetch_one("SELECT * FROM knowledge_sources WHERE name = ? AND source_type = ?", (source_name, source_type))
@@ -848,8 +939,8 @@ class AIMemory:
         document_id = make_id("doc")
         self.db.execute(
             """
-            INSERT INTO documents(id, source_id, title, user_id, owner_agent_id, kb_namespace, source_subject_type, source_subject_id, external_id, status, metadata, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO documents(id, source_id, title, user_id, owner_agent_id, kb_namespace, source_subject_type, source_subject_id, namespace_key, external_id, status, metadata, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 document_id,
@@ -860,15 +951,16 @@ class AIMemory:
                 kb_namespace,
                 source_subject_type,
                 source_subject_id,
+                scope.get("namespace_key"),
                 external_id,
                 "active",
-                json_dumps(merge_metadata(metadata, {"owner_agent_id": owner_agent_id, "source_subject_type": source_subject_type, "source_subject_id": source_subject_id})),
+                json_dumps(merge_metadata(metadata, self._scope_metadata(scope))),
                 now,
                 now,
             ),
         )
-        stored = self.object_store.put_text(text, object_type="knowledge", suffix=".txt")
-        object_row = self._persist_object(stored, mime_type="text/plain", metadata={"document_id": document_id, **metadata})
+        stored = self.object_store.put_text(text, object_type="knowledge", suffix=".txt", prefix=self._object_store_prefix(scope, "knowledge"))
+        object_row = self._persist_object(stored, mime_type="text/plain", metadata={"document_id": document_id, **self._scope_metadata(scope), **metadata})
         version_id = make_id("docver")
         self.db.execute(
             """
@@ -880,7 +972,7 @@ class AIMemory:
         chunks = chunk_text(text, chunk_size=chunk_size, overlap=chunk_overlap)
         for index, chunk in enumerate(chunks):
             chunk_id = make_id("chunk")
-            chunk_metadata = {"chunk_index": index, **metadata}
+            chunk_metadata = {"chunk_index": index, **self._scope_metadata(scope), **metadata}
             self.db.execute(
                 """
                 INSERT INTO document_chunks(id, document_id, version_id, chunk_index, content, tokens, metadata, created_at)
@@ -896,6 +988,7 @@ class AIMemory:
                     "owner_agent_id": owner_agent_id,
                     "source_subject_type": source_subject_type,
                     "source_subject_id": source_subject_id,
+                    "namespace_key": scope.get("namespace_key"),
                     "title": title,
                     "content": chunk,
                     "metadata": chunk_metadata,
@@ -925,6 +1018,11 @@ class AIMemory:
         owner_agent_id: str | None = None,
         subject_type: str | None = None,
         subject_id: str | None = None,
+        platform_id: str | None = None,
+        workspace_id: str | None = None,
+        team_id: str | None = None,
+        project_id: str | None = None,
+        namespace_key: str | None = None,
         limit: int = 10,
         threshold: float = 0.0,
         filters: dict[str, Any] | None = None,
@@ -943,6 +1041,20 @@ class AIMemory:
         if subject_id:
             sql_filters.append("(d.source_subject_id = ? OR d.source_subject_id IS NULL)")
             params.append(subject_id)
+        namespace_filter = self._namespace_filter_value(
+            user_id=user_id,
+            owner_agent_id=owner_agent_id,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            platform_id=platform_id,
+            workspace_id=workspace_id,
+            team_id=team_id,
+            project_id=project_id,
+            namespace_key=namespace_key,
+        )
+        if namespace_filter:
+            sql_filters.append("d.namespace_key = ?")
+            params.append(namespace_filter)
         rows = self.db.fetch_all(
             f"""
             SELECT dc.id, dc.document_id, dc.content AS text, dc.metadata, d.title, d.user_id, d.owner_agent_id, d.source_subject_type, d.source_subject_id, d.updated_at, sic.embedding
@@ -974,9 +1086,23 @@ class AIMemory:
 
     def save_skill(self, name: str, description: str, **kwargs) -> dict[str, Any]:
         now = utcnow_iso()
-        owner_agent_id = kwargs.pop("owner_agent_id", kwargs.pop("owner_id", None))
-        source_subject_type = kwargs.pop("source_subject_type", kwargs.pop("subject_type", None))
-        source_subject_id = kwargs.pop("source_subject_id", kwargs.pop("subject_id", None))
+        owner_id = kwargs.pop("owner_id", None)
+        scope = self._resolve_scope(
+            agent_id=kwargs.pop("agent_id", owner_id),
+            owner_agent_id=kwargs.pop("owner_agent_id", owner_id),
+            subject_type=kwargs.pop("source_subject_type", kwargs.pop("subject_type", None)),
+            subject_id=kwargs.pop("source_subject_id", kwargs.pop("subject_id", None)),
+            interaction_type=kwargs.pop("interaction_type", None),
+            user_id=kwargs.pop("user_id", None),
+            platform_id=kwargs.pop("platform_id", None),
+            workspace_id=kwargs.pop("workspace_id", None),
+            team_id=kwargs.pop("team_id", None),
+            project_id=kwargs.pop("project_id", None),
+            namespace_key=kwargs.pop("namespace_key", None),
+        )
+        owner_agent_id = scope["owner_agent_id"]
+        source_subject_type = scope["subject_type"]
+        source_subject_id = scope["subject_id"]
         if owner_agent_id:
             skill = self.db.fetch_one("SELECT * FROM skills WHERE name = ? AND COALESCE(owner_agent_id, owner_id) = ?", (name, owner_agent_id))
         else:
@@ -986,8 +1112,8 @@ class AIMemory:
             skill_id = make_id("skill")
             self.db.execute(
                 """
-                INSERT INTO skills(id, name, description, owner_id, owner_agent_id, source_subject_type, source_subject_id, status, metadata, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO skills(id, name, description, owner_id, owner_agent_id, source_subject_type, source_subject_id, namespace_key, status, metadata, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     skill_id,
@@ -997,8 +1123,9 @@ class AIMemory:
                     owner_agent_id,
                     source_subject_type,
                     source_subject_id,
+                    scope.get("namespace_key"),
                     "active",
-                    json_dumps(merge_metadata(metadata, {"owner_agent_id": owner_agent_id, "source_subject_type": source_subject_type, "source_subject_id": source_subject_id})),
+                    json_dumps(merge_metadata(metadata, self._scope_metadata(scope))),
                     now,
                     now,
                 ),
@@ -1009,7 +1136,7 @@ class AIMemory:
             self.db.execute(
                 """
                 UPDATE skills
-                SET description = ?, owner_id = ?, owner_agent_id = ?, source_subject_type = ?, source_subject_id = ?, metadata = ?, updated_at = ?
+                SET description = ?, owner_id = ?, owner_agent_id = ?, source_subject_type = ?, source_subject_id = ?, namespace_key = ?, metadata = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -1018,7 +1145,8 @@ class AIMemory:
                     owner_agent_id or skill.get("owner_agent_id") or skill.get("owner_id"),
                     source_subject_type or skill.get("source_subject_type"),
                     source_subject_id or skill.get("source_subject_id"),
-                    json_dumps(merge_metadata(merged_metadata, {"owner_agent_id": owner_agent_id or skill.get("owner_agent_id") or skill.get("owner_id"), "source_subject_type": source_subject_type, "source_subject_id": source_subject_id})),
+                    scope.get("namespace_key") or skill.get("namespace_key"),
+                    json_dumps(merge_metadata(merged_metadata, self._scope_metadata(scope))),
                     now,
                     skill_id,
                 ),
@@ -1041,8 +1169,13 @@ class AIMemory:
             "tests": tests,
             "metadata": metadata,
         }
-        stored = self.object_store.put_text(json_dumps(asset_payload), object_type="skills", suffix=".json")
-        object_row = self._persist_object(stored, mime_type="application/json", metadata={"skill_id": skill_id, **metadata})
+        stored = self.object_store.put_text(
+            json_dumps(asset_payload),
+            object_type="skills",
+            suffix=".json",
+            prefix=self._object_store_prefix(scope, "skill"),
+        )
+        object_row = self._persist_object(stored, mime_type="application/json", metadata={"skill_id": skill_id, **self._scope_metadata(scope), **metadata})
         version_id = make_id("skillver")
         workflow_text = workflow if isinstance(workflow, str) else json_dumps(workflow or {})
         self.db.execute(
@@ -1076,22 +1209,23 @@ class AIMemory:
                 ),
             )
         self._index_skill(
-            {
-                "record_id": version_id,
-                "skill_id": skill_id,
-                "version": version,
-                "name": name,
+                {
+                    "record_id": version_id,
+                    "skill_id": skill_id,
+                    "version": version,
+                    "name": name,
                 "description": description,
                 "text": "\n".join(part for part in [name, description, prompt_template or "", workflow_text, " ".join(topics), " ".join(tools)] if part),
                 "tools": tools,
                 "topics": topics,
-                "owner_agent_id": owner_agent_id or (skill.get("owner_agent_id") if skill else None),
-                "source_subject_type": source_subject_type,
-                "source_subject_id": source_subject_id,
-                "metadata": metadata,
-                "updated_at": now,
-            }
-        )
+                    "owner_agent_id": owner_agent_id or (skill.get("owner_agent_id") if skill else None),
+                    "source_subject_type": source_subject_type,
+                    "source_subject_id": source_subject_id,
+                    "namespace_key": scope.get("namespace_key") or (skill.get("namespace_key") if skill else None),
+                    "metadata": metadata,
+                    "updated_at": now,
+                }
+            )
         return self.get_skill(skill_id)
 
     def register_skill(self, name: str, description: str, **kwargs) -> dict[str, Any]:
@@ -1141,6 +1275,11 @@ class AIMemory:
         owner_agent_id: str | None = None,
         subject_type: str | None = None,
         subject_id: str | None = None,
+        platform_id: str | None = None,
+        workspace_id: str | None = None,
+        team_id: str | None = None,
+        project_id: str | None = None,
+        namespace_key: str | None = None,
         limit: int = 10,
         threshold: float = 0.0,
         filters: dict[str, Any] | None = None,
@@ -1156,6 +1295,19 @@ class AIMemory:
         if subject_id:
             sql_filters.append("(si.source_subject_id = ? OR si.source_subject_id IS NULL)")
             params.append(subject_id)
+        namespace_filter = self._namespace_filter_value(
+            owner_agent_id=owner_agent_id,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            platform_id=platform_id,
+            workspace_id=workspace_id,
+            team_id=team_id,
+            project_id=project_id,
+            namespace_key=namespace_key,
+        )
+        if namespace_filter:
+            sql_filters.append("si.namespace_key = ?")
+            params.append(namespace_filter)
         rows = self.db.fetch_all(
             f"""
             SELECT si.*, s.status, sic.embedding
@@ -1194,14 +1346,19 @@ class AIMemory:
         now = utcnow_iso()
         metadata = dict(kwargs.pop("metadata", {}) or {})
         payload = {"memory": memory, "metadata": metadata}
-        stored = self.object_store.put_text(json_dumps(payload), object_type="archive", suffix=".json")
-        object_row = self._persist_object(stored, mime_type="application/json", metadata={"memory_id": memory_id, **metadata})
+        stored = self.object_store.put_text(
+            json_dumps(payload),
+            object_type="archive",
+            suffix=".json",
+            prefix=self._object_store_prefix(memory, "archive"),
+        )
+        object_row = self._persist_object(stored, mime_type="application/json", metadata={"memory_id": memory_id, **self._scope_metadata(memory), **metadata})
         archive_id = make_id("arch")
         summary_text = memory.get("summary") or build_summary(split_sentences(memory["text"]), max_sentences=3, max_chars=240)
         self.db.execute(
             """
-            INSERT INTO archive_units(id, domain, source_id, user_id, owner_agent_id, subject_type, subject_id, interaction_type, source_type, session_id, object_id, summary, metadata, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO archive_units(id, domain, source_id, user_id, owner_agent_id, subject_type, subject_id, interaction_type, namespace_key, source_type, session_id, object_id, summary, metadata, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 archive_id,
@@ -1212,6 +1369,7 @@ class AIMemory:
                 memory.get("subject_type"),
                 memory.get("subject_id"),
                 memory.get("interaction_type"),
+                memory.get("namespace_key"),
                 "memory",
                 memory.get("session_id"),
                 object_row["id"],
@@ -1241,6 +1399,7 @@ class AIMemory:
                 "subject_type": memory.get("subject_type"),
                 "subject_id": memory.get("subject_id"),
                 "interaction_type": memory.get("interaction_type"),
+                "namespace_key": memory.get("namespace_key"),
                 "source_type": "memory",
                 "session_id": memory.get("session_id"),
                 "text": summary_text,
@@ -1285,13 +1444,18 @@ class AIMemory:
             "memories": memories,
             "compression": compression.as_dict(),
         }
-        stored = self.object_store.put_text(json_dumps(payload), object_type="archive", suffix=".json")
-        object_row = self._persist_object(stored, mime_type="application/json", metadata={"session_id": session_id, **metadata})
+        stored = self.object_store.put_text(
+            json_dumps(payload),
+            object_type="archive",
+            suffix=".json",
+            prefix=self._object_store_prefix(session, "archive"),
+        )
+        object_row = self._persist_object(stored, mime_type="application/json", metadata={"session_id": session_id, **self._scope_metadata(session), **metadata})
         archive_id = make_id("arch")
         self.db.execute(
             """
-            INSERT INTO archive_units(id, domain, source_id, user_id, owner_agent_id, subject_type, subject_id, interaction_type, source_type, session_id, object_id, summary, metadata, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO archive_units(id, domain, source_id, user_id, owner_agent_id, subject_type, subject_id, interaction_type, namespace_key, source_type, session_id, object_id, summary, metadata, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 archive_id,
@@ -1302,6 +1466,7 @@ class AIMemory:
                 session.get("subject_type"),
                 session.get("subject_id"),
                 session.get("interaction_type"),
+                session.get("namespace_key"),
                 "session",
                 session_id,
                 object_row["id"],
@@ -1328,6 +1493,7 @@ class AIMemory:
                 "subject_type": session.get("subject_type"),
                 "subject_id": session.get("subject_id"),
                 "interaction_type": session.get("interaction_type"),
+                "namespace_key": session.get("namespace_key"),
                 "source_type": "session",
                 "session_id": session_id,
                 "text": compression.summary,
@@ -1361,6 +1527,11 @@ class AIMemory:
         subject_id: str | None = None,
         interaction_type: str | None = None,
         session_id: str | None = None,
+        platform_id: str | None = None,
+        workspace_id: str | None = None,
+        team_id: str | None = None,
+        project_id: str | None = None,
+        namespace_key: str | None = None,
         limit: int = 10,
         threshold: float = 0.0,
         filters: dict[str, Any] | None = None,
@@ -1385,6 +1556,21 @@ class AIMemory:
         if session_id:
             sql_filters.append("asi.session_id = ?")
             params.append(session_id)
+        namespace_filter = self._namespace_filter_value(
+            user_id=user_id,
+            owner_agent_id=owner_agent_id,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            interaction_type=interaction_type,
+            platform_id=platform_id,
+            workspace_id=workspace_id,
+            team_id=team_id,
+            project_id=project_id,
+            namespace_key=namespace_key,
+        )
+        if namespace_filter:
+            sql_filters.append("asi.namespace_key = ?")
+            params.append(namespace_filter)
         rows = self.db.fetch_all(
             f"""
             SELECT asi.*, sic.embedding
@@ -1427,6 +1613,11 @@ class AIMemory:
         subject_id: str | None = None,
         interaction_type: str | None = None,
         session_id: str | None = None,
+        platform_id: str | None = None,
+        workspace_id: str | None = None,
+        team_id: str | None = None,
+        project_id: str | None = None,
+        namespace_key: str | None = None,
         limit: int = 10,
         threshold: float = 0.0,
         filters: dict[str, Any] | None = None,
@@ -1451,6 +1642,21 @@ class AIMemory:
         if interaction_type:
             sql_filters.append("(s.interaction_type = ? OR s.interaction_type IS NULL)")
             params.append(interaction_type)
+        namespace_filter = self._namespace_filter_value(
+            user_id=user_id,
+            owner_agent_id=owner_agent_id,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            interaction_type=interaction_type,
+            platform_id=platform_id,
+            workspace_id=workspace_id,
+            team_id=team_id,
+            project_id=project_id,
+            namespace_key=namespace_key,
+        )
+        if namespace_filter:
+            sql_filters.append("s.namespace_key = ?")
+            params.append(namespace_filter)
         rows = self.db.fetch_all(
             f"""
             SELECT ct.id, ct.session_id, ct.role, ct.turn_type, ct.speaker_participant_id, ct.target_participant_id, ct.salience_score, s.owner_agent_id, s.subject_type, s.subject_id, s.interaction_type, ct.content AS text, ct.metadata, ct.created_at AS updated_at
@@ -1501,6 +1707,9 @@ class AIMemory:
         if interaction_type:
             snapshot_filters.append("(wms.interaction_type = ? OR wms.interaction_type IS NULL)")
             snapshot_params.append(interaction_type)
+        if namespace_filter:
+            snapshot_filters.append("wms.namespace_key = ?")
+            snapshot_params.append(namespace_filter)
         snapshot_rows = self.db.fetch_all(
             f"""
             SELECT wms.id, wms.session_id, wms.owner_agent_id, wms.subject_type, wms.subject_id, wms.interaction_type, wms.summary AS text, wms.metadata, wms.updated_at
@@ -1543,6 +1752,11 @@ class AIMemory:
         user_id: str | None = None,
         owner_agent_id: str | None = None,
         session_id: str | None = None,
+        platform_id: str | None = None,
+        workspace_id: str | None = None,
+        team_id: str | None = None,
+        project_id: str | None = None,
+        namespace_key: str | None = None,
         limit: int = 10,
         threshold: float = 0.0,
         filters: dict[str, Any] | None = None,
@@ -1558,6 +1772,18 @@ class AIMemory:
         if session_id:
             sql_filters.append("session_id = ?")
             params.append(session_id)
+        namespace_filter = self._namespace_filter_value(
+            user_id=user_id,
+            owner_agent_id=owner_agent_id,
+            platform_id=platform_id,
+            workspace_id=workspace_id,
+            team_id=team_id,
+            project_id=project_id,
+            namespace_key=namespace_key,
+        )
+        if namespace_filter:
+            sql_filters.append("namespace_key = ?")
+            params.append(namespace_filter)
         runs = self.db.fetch_all(f"SELECT * FROM runs WHERE {' AND '.join(sql_filters)} ORDER BY updated_at DESC LIMIT 80", tuple(params))
         prepared: list[dict[str, Any]] = []
         for run in runs:
@@ -1616,6 +1842,11 @@ class AIMemory:
                 subject_type=session.get("subject_type"),
                 subject_id=session.get("subject_id"),
                 interaction_type=session.get("interaction_type"),
+                platform_id=session.get("platform_id"),
+                workspace_id=session.get("workspace_id"),
+                team_id=session.get("team_id"),
+                project_id=session.get("project_id"),
+                namespace_key=session.get("namespace_key"),
                 session_id=session_id,
                 metadata={"promoted_from_session": session_id, **candidate.metadata},
                 memory_type=candidate.memory_type,
@@ -1645,8 +1876,8 @@ class AIMemory:
         now = utcnow_iso()
         self.db.execute(
             """
-            INSERT INTO working_memory_snapshots(id, session_id, run_id, owner_agent_id, interaction_type, subject_type, subject_id, summary, plan, scratchpad, window_size, constraints, resolved_items, unresolved_items, next_actions, budget_tokens, salience_vector, compression_revision, metadata, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO working_memory_snapshots(id, session_id, run_id, owner_agent_id, interaction_type, subject_type, subject_id, namespace_key, summary, plan, scratchpad, window_size, constraints, resolved_items, unresolved_items, next_actions, budget_tokens, salience_vector, compression_revision, metadata, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 snapshot_id,
@@ -1656,6 +1887,7 @@ class AIMemory:
                 session.get("interaction_type"),
                 session.get("subject_type"),
                 session.get("subject_id"),
+                session.get("namespace_key"),
                 compression.summary,
                 None,
                 None,
@@ -1768,7 +2000,7 @@ class AIMemory:
         knowledge_rows = _deserialize_rows(
             self.db.fetch_all(
                 """
-                SELECT dc.id, dc.document_id, d.source_id, d.owner_agent_id, d.source_subject_type, d.source_subject_id, d.title, dc.content, dc.metadata, d.updated_at
+                SELECT dc.id, dc.document_id, d.source_id, d.owner_agent_id, d.source_subject_type, d.source_subject_id, d.namespace_key, d.title, dc.content, dc.metadata, d.updated_at
                 FROM document_chunks dc
                 JOIN documents d ON d.id = dc.document_id
                 WHERE d.status = 'active'
@@ -1787,6 +2019,7 @@ class AIMemory:
                     "owner_agent_id": row.get("owner_agent_id"),
                     "source_subject_type": row.get("source_subject_type"),
                     "source_subject_id": row.get("source_subject_id"),
+                    "namespace_key": row.get("namespace_key"),
                     "title": row["title"],
                     "content": row["content"],
                     "metadata": row.get("metadata", {}),
@@ -1797,7 +2030,7 @@ class AIMemory:
         skill_rows = _deserialize_rows(
             self.db.fetch_all(
                 """
-                SELECT sv.id AS record_id, sv.skill_id, sv.version, s.owner_agent_id, s.source_subject_type, s.source_subject_id, s.name, s.description, sv.workflow, sv.prompt_template, s.metadata, s.updated_at
+                SELECT sv.id AS record_id, sv.skill_id, sv.version, s.owner_agent_id, s.source_subject_type, s.source_subject_id, s.namespace_key, s.name, s.description, sv.workflow, sv.prompt_template, s.metadata, s.updated_at
                 FROM skill_versions sv
                 JOIN skills s ON s.id = sv.skill_id
                 WHERE s.status = 'active'
@@ -1838,6 +2071,7 @@ class AIMemory:
                     "portable_storage": True,
                     "multi_domain_memory": True,
                     "agent_facing_mcp": True,
+                    "team_scoped_namespace": True,
                 },
             ),
             "embeddings": describe_embedding_runtime(),
@@ -1867,18 +2101,25 @@ class AIMemory:
                     "tool_schema_export": True,
                     "fastmcp_binding": True,
                     "service_required": False,
+                    "scoped_tool_defaults": True,
                 },
                 items={
                     "tools": [item["name"] for item in self.create_mcp_adapter().tool_specs()],
                     "litellm": self.config.providers.as_litellm_kwargs(),
+                    "storage_layout": self.storage_layout(),
                 },
             ),
         }
 
-    def create_mcp_adapter(self):
+    def scoped(self, **scope_kwargs: Any):
+        from aimemory.core.scoped import ScopedAIMemory
+
+        return ScopedAIMemory(self, scope_kwargs)
+
+    def create_mcp_adapter(self, scope: dict[str, Any] | None = None):
         from aimemory.mcp.adapter import AIMemoryMCPAdapter
 
-        return AIMemoryMCPAdapter(self)
+        return AIMemoryMCPAdapter(self, scope=scope)
 
     def litellm_config(self) -> dict[str, Any]:
         return self.config.providers.as_litellm_kwargs()
@@ -1958,12 +2199,21 @@ class AIMemory:
         subject_type: str | None = None,
         subject_id: str | None = None,
         interaction_type: str | None = None,
+        platform_id: str | None = None,
+        workspace_id: str | None = None,
+        team_id: str | None = None,
+        project_id: str | None = None,
+        namespace_key: str | None = None,
         session: dict[str, Any] | None = None,
     ) -> dict[str, str | None]:
         resolved_user_id = user_id or (session.get("user_id") if session else None) or self.config.default_user_id
         resolved_owner_agent_id = owner_agent_id or agent_id or (session.get("owner_agent_id") if session else None) or (session.get("agent_id") if session else None)
         resolved_subject_type = subject_type or (session.get("subject_type") if session else None)
         resolved_subject_id = subject_id or (session.get("subject_id") if session else None)
+        resolved_platform_id = platform_id or (session.get("platform_id") if session else None) or self.config.platform_id
+        resolved_workspace_id = workspace_id or (session.get("workspace_id") if session else None) or self.config.workspace_id
+        resolved_team_id = team_id or (session.get("team_id") if session else None) or self.config.team_id
+        resolved_project_id = project_id or (session.get("project_id") if session else None) or self.config.project_id
         if resolved_subject_type is None:
             if resolved_subject_id is not None:
                 resolved_subject_type = "human" if resolved_subject_id == resolved_user_id else "agent"
@@ -1974,24 +2224,115 @@ class AIMemory:
         resolved_interaction_type = interaction_type or (session.get("interaction_type") if session else None)
         if resolved_interaction_type is None:
             resolved_interaction_type = "agent_agent" if resolved_subject_type == "agent" else "human_agent"
+        scope = CollaborationScope(
+            user_id=resolved_user_id,
+            agent_id=agent_id,
+            owner_agent_id=resolved_owner_agent_id,
+            subject_type=resolved_subject_type,
+            subject_id=resolved_subject_id,
+            interaction_type=resolved_interaction_type,
+            platform_id=resolved_platform_id,
+            workspace_id=resolved_workspace_id,
+            team_id=resolved_team_id,
+            project_id=resolved_project_id,
+            namespace_key=namespace_key or (session.get("namespace_key") if session else None),
+        )
         return {
-            "user_id": resolved_user_id,
-            "owner_agent_id": resolved_owner_agent_id,
-            "subject_type": resolved_subject_type,
-            "subject_id": resolved_subject_id,
-            "interaction_type": resolved_interaction_type,
+            **scope.as_metadata(),
         }
 
     def _scope_metadata(self, scope: dict[str, Any]) -> dict[str, Any]:
         return {
             key: value
             for key, value in {
+                "user_id": scope.get("user_id"),
                 "owner_agent_id": scope.get("owner_agent_id"),
                 "subject_type": scope.get("subject_type"),
                 "subject_id": scope.get("subject_id"),
                 "interaction_type": scope.get("interaction_type"),
+                "platform_id": scope.get("platform_id"),
+                "workspace_id": scope.get("workspace_id"),
+                "team_id": scope.get("team_id"),
+                "project_id": scope.get("project_id"),
+                "namespace_key": scope.get("namespace_key"),
             }.items()
             if value is not None
+        }
+
+    def _namespace_filter_value(
+        self,
+        *,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        owner_agent_id: str | None = None,
+        subject_type: str | None = None,
+        subject_id: str | None = None,
+        interaction_type: str | None = None,
+        platform_id: str | None = None,
+        workspace_id: str | None = None,
+        team_id: str | None = None,
+        project_id: str | None = None,
+        namespace_key: str | None = None,
+        session: dict[str, Any] | None = None,
+    ) -> str | None:
+        scope = self._resolve_scope(
+            user_id=user_id,
+            agent_id=agent_id,
+            owner_agent_id=owner_agent_id,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            interaction_type=interaction_type,
+            platform_id=platform_id,
+            workspace_id=workspace_id,
+            team_id=team_id,
+            project_id=project_id,
+            namespace_key=namespace_key,
+            session=session,
+        )
+        if namespace_key:
+            return namespace_key
+        if any(scope.get(key) for key in ("platform_id", "workspace_id", "team_id", "project_id")):
+            return scope.get("namespace_key")
+        return None
+
+    def _object_store_prefix(self, scope: dict[str, Any], domain: str) -> str:
+        return CollaborationScope.from_value(scope).storage_prefix(domain)
+
+    def storage_layout(self, **scope_kwargs: Any) -> dict[str, Any]:
+        scope = self._resolve_scope(**scope_kwargs)
+        return {
+            "scope": scope,
+            "vector_backend": self._resolve_vector_backend_name(),
+            "graph_backend": self._resolve_graph_backend_name(),
+            "domains": {
+                "long_term_memory": {
+                    "tables": ["memories", "memory_index"],
+                    "object_prefix": self._object_store_prefix(scope, "memory"),
+                    "scope": str(MemoryScope.LONG_TERM),
+                    "strategy": "dedupe + semantic distill + hybrid retrieval",
+                },
+                "short_term_memory": {
+                    "tables": ["conversation_turns", "working_memory_snapshots", "memories"],
+                    "object_prefix": self._object_store_prefix(scope, "interaction"),
+                    "scope": str(MemoryScope.SESSION),
+                    "strategy": "session turns + salience compression + promotion",
+                },
+                "knowledge": {
+                    "tables": ["documents", "document_chunks", "knowledge_chunk_index"],
+                    "object_prefix": self._object_store_prefix(scope, "knowledge"),
+                    "strategy": "chunk + semantic index + lightweight rerank",
+                },
+                "skill": {
+                    "tables": ["skills", "skill_versions", "skill_index"],
+                    "object_prefix": self._object_store_prefix(scope, "skill"),
+                    "strategy": "versioned procedural memory + semantic search",
+                },
+                "archive": {
+                    "tables": ["archive_units", "archive_summaries", "archive_summary_index"],
+                    "object_prefix": self._object_store_prefix(scope, "archive"),
+                    "strategy": "budget compression + low-cost summary retrieval",
+                },
+            },
         }
 
     def _ensure_participant(
@@ -2100,6 +2441,11 @@ class AIMemory:
         subject_type: str | None = None,
         subject_id: str | None = None,
         interaction_type: str | None = None,
+        platform_id: str | None = None,
+        workspace_id: str | None = None,
+        team_id: str | None = None,
+        project_id: str | None = None,
+        namespace_key: str | None = None,
         run_id: str | None = None,
         actor_id: str | None = None,
         role: str | None = None,
@@ -2111,6 +2457,11 @@ class AIMemory:
             subject_type=subject_type,
             subject_id=subject_id,
             interaction_type=interaction_type,
+            platform_id=platform_id,
+            workspace_id=workspace_id,
+            team_id=team_id,
+            project_id=project_id,
+            namespace_key=namespace_key,
         )
         return MemoryScopeContext(
             user_id=scope["user_id"],
@@ -2120,6 +2471,11 @@ class AIMemory:
             subject_type=scope["subject_type"],
             subject_id=scope["subject_id"],
             interaction_type=scope["interaction_type"],
+            platform_id=scope.get("platform_id"),
+            workspace_id=scope.get("workspace_id"),
+            team_id=scope.get("team_id"),
+            project_id=scope.get("project_id"),
+            namespace_key=scope.get("namespace_key"),
             run_id=run_id,
             actor_id=actor_id,
             role=role,
@@ -2170,6 +2526,9 @@ class AIMemory:
         if context.interaction_type:
             filters.append("(interaction_type = ? OR interaction_type IS NULL)")
             params.append(context.interaction_type)
+        if context.namespace_key:
+            filters.append("namespace_key = ?")
+            params.append(context.namespace_key)
         if not long_term and context.session_id:
             filters.append("session_id = ?")
             params.append(context.session_id)
@@ -2189,6 +2548,11 @@ class AIMemory:
         subject_type: str | None = None,
         subject_id: str | None = None,
         interaction_type: str | None = None,
+        platform_id: str | None = None,
+        workspace_id: str | None = None,
+        team_id: str | None = None,
+        project_id: str | None = None,
+        namespace_key: str | None = None,
         session_id: str | None = None,
         run_id: str | None = None,
         metadata: dict[str, Any] | None = None,
@@ -2208,12 +2572,18 @@ class AIMemory:
             subject_type=subject_type,
             subject_id=subject_id,
             interaction_type=interaction_type,
+            platform_id=platform_id,
+            workspace_id=workspace_id,
+            team_id=team_id,
+            project_id=project_id,
+            namespace_key=namespace_key,
         )
         user_id = resolved_scope["user_id"] or self.config.default_user_id
         owner_agent_id = resolved_scope["owner_agent_id"]
         subject_type = resolved_scope["subject_type"]
         subject_id = resolved_scope["subject_id"]
         interaction_type = resolved_scope["interaction_type"]
+        namespace_key = resolved_scope.get("namespace_key")
         metadata = merge_metadata(metadata or {}, self._scope_metadata(resolved_scope))
         now = utcnow_iso()
         existing, relation = self._find_existing_memory(
@@ -2223,6 +2593,7 @@ class AIMemory:
             subject_type=subject_type,
             subject_id=subject_id,
             interaction_type=interaction_type,
+            namespace_key=namespace_key,
             session_id=session_id,
             scope=scope,
         )
@@ -2232,10 +2603,10 @@ class AIMemory:
             self.db.execute(
                 """
                 UPDATE memories
-                SET importance = ?, metadata = ?, updated_at = ?
+                SET importance = ?, namespace_key = ?, metadata = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (new_importance, json_dumps(merged_metadata), now, existing["id"]),
+                (new_importance, namespace_key or existing.get("namespace_key"), json_dumps(merged_metadata), now, existing["id"]),
             )
             self._record_memory_event(existing["id"], "DUPLICATE_TOUCH", {"incoming_text": cleaned})
             touched = self.get(existing["id"])
@@ -2251,10 +2622,10 @@ class AIMemory:
             self.db.execute(
                 """
                 UPDATE memories
-                SET text = ?, summary = ?, importance = ?, metadata = ?, updated_at = ?
+                SET text = ?, summary = ?, importance = ?, namespace_key = ?, metadata = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (merged_text, merged_summary, new_importance, json_dumps(merged_metadata), now, existing["id"]),
+                (merged_text, merged_summary, new_importance, namespace_key or existing.get("namespace_key"), json_dumps(merged_metadata), now, existing["id"]),
             )
             self._record_memory_event(existing["id"], "MERGE", {"incoming_text": cleaned})
             merged = self.get(existing["id"])
@@ -2267,8 +2638,8 @@ class AIMemory:
         summary = build_summary(split_sentences(cleaned), max_sentences=3, max_chars=220)
         self.db.execute(
             """
-            INSERT INTO memories(id, user_id, agent_id, owner_agent_id, subject_type, subject_id, interaction_type, session_id, run_id, source_session_id, source_run_id, scope, memory_type, text, summary, importance, status, source, metadata, created_at, updated_at, archived_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO memories(id, user_id, agent_id, owner_agent_id, subject_type, subject_id, interaction_type, namespace_key, session_id, run_id, source_session_id, source_run_id, scope, memory_type, text, summary, importance, status, source, metadata, created_at, updated_at, archived_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 memory_id,
@@ -2278,6 +2649,7 @@ class AIMemory:
                 subject_type,
                 subject_id,
                 interaction_type,
+                namespace_key,
                 session_id,
                 run_id,
                 session_id,
@@ -2311,6 +2683,7 @@ class AIMemory:
         subject_type: str | None,
         subject_id: str | None,
         interaction_type: str | None,
+        namespace_key: str | None,
         session_id: str | None,
         scope: str,
     ) -> tuple[dict[str, Any] | None, str | None]:
@@ -2328,6 +2701,9 @@ class AIMemory:
         if interaction_type:
             filters.append("(m.interaction_type = ? OR m.interaction_type IS NULL)")
             params.append(interaction_type)
+        if namespace_key:
+            filters.append("m.namespace_key = ?")
+            params.append(namespace_key)
         if scope == str(MemoryScope.SESSION) and session_id:
             filters.append("m.session_id = ?")
             params.append(session_id)
@@ -2391,8 +2767,8 @@ class AIMemory:
         keywords = extract_keywords(memory["text"])
         self.db.execute(
             """
-            INSERT INTO memory_index(record_id, domain, scope, user_id, owner_agent_id, subject_type, subject_id, interaction_type, session_id, text, keywords, score_boost, updated_at, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO memory_index(record_id, domain, scope, user_id, owner_agent_id, subject_type, subject_id, interaction_type, namespace_key, session_id, text, keywords, score_boost, updated_at, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(record_id) DO UPDATE SET
                 scope = excluded.scope,
                 user_id = excluded.user_id,
@@ -2400,6 +2776,7 @@ class AIMemory:
                 subject_type = excluded.subject_type,
                 subject_id = excluded.subject_id,
                 interaction_type = excluded.interaction_type,
+                namespace_key = excluded.namespace_key,
                 session_id = excluded.session_id,
                 text = excluded.text,
                 keywords = excluded.keywords,
@@ -2416,6 +2793,7 @@ class AIMemory:
                 memory.get("subject_type"),
                 memory.get("subject_id"),
                 memory.get("interaction_type"),
+                memory.get("namespace_key"),
                 memory.get("session_id"),
                 memory["text"],
                 json_dumps(keywords),
@@ -2448,14 +2826,15 @@ class AIMemory:
         keywords = extract_keywords(" ".join(part for part in [payload.get("title"), payload.get("content")] if part))
         self.db.execute(
             """
-            INSERT INTO knowledge_chunk_index(record_id, document_id, source_id, owner_agent_id, source_subject_type, source_subject_id, title, text, keywords, updated_at, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO knowledge_chunk_index(record_id, document_id, source_id, owner_agent_id, source_subject_type, source_subject_id, namespace_key, title, text, keywords, updated_at, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(record_id) DO UPDATE SET
                 document_id = excluded.document_id,
                 source_id = excluded.source_id,
                 owner_agent_id = excluded.owner_agent_id,
                 source_subject_type = excluded.source_subject_type,
                 source_subject_id = excluded.source_subject_id,
+                namespace_key = excluded.namespace_key,
                 title = excluded.title,
                 text = excluded.text,
                 keywords = excluded.keywords,
@@ -2469,6 +2848,7 @@ class AIMemory:
                 payload.get("owner_agent_id"),
                 payload.get("source_subject_type"),
                 payload.get("source_subject_id"),
+                payload.get("namespace_key"),
                 payload.get("title"),
                 payload["content"],
                 json_dumps(keywords),
@@ -2492,14 +2872,15 @@ class AIMemory:
         keywords = extract_keywords(payload["text"])
         self.db.execute(
             """
-            INSERT INTO skill_index(record_id, skill_id, version, owner_agent_id, source_subject_type, source_subject_id, name, description, text, keywords, updated_at, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO skill_index(record_id, skill_id, version, owner_agent_id, source_subject_type, source_subject_id, namespace_key, name, description, text, keywords, updated_at, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(record_id) DO UPDATE SET
                 skill_id = excluded.skill_id,
                 version = excluded.version,
                 owner_agent_id = excluded.owner_agent_id,
                 source_subject_type = excluded.source_subject_type,
                 source_subject_id = excluded.source_subject_id,
+                namespace_key = excluded.namespace_key,
                 name = excluded.name,
                 description = excluded.description,
                 text = excluded.text,
@@ -2514,6 +2895,7 @@ class AIMemory:
                 payload.get("owner_agent_id"),
                 payload.get("source_subject_type"),
                 payload.get("source_subject_id"),
+                payload.get("namespace_key"),
                 payload["name"],
                 payload.get("description"),
                 payload["text"],
@@ -2538,8 +2920,8 @@ class AIMemory:
         keywords = payload.get("keywords") or extract_keywords(payload["text"])
         self.db.execute(
             """
-            INSERT INTO archive_summary_index(record_id, archive_unit_id, domain, user_id, owner_agent_id, subject_type, subject_id, interaction_type, source_type, session_id, text, keywords, updated_at, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO archive_summary_index(record_id, archive_unit_id, domain, user_id, owner_agent_id, subject_type, subject_id, interaction_type, namespace_key, source_type, session_id, text, keywords, updated_at, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(record_id) DO UPDATE SET
                 archive_unit_id = excluded.archive_unit_id,
                 domain = excluded.domain,
@@ -2548,6 +2930,7 @@ class AIMemory:
                 subject_type = excluded.subject_type,
                 subject_id = excluded.subject_id,
                 interaction_type = excluded.interaction_type,
+                namespace_key = excluded.namespace_key,
                 source_type = excluded.source_type,
                 session_id = excluded.session_id,
                 text = excluded.text,
@@ -2564,6 +2947,7 @@ class AIMemory:
                 payload.get("subject_type"),
                 payload.get("subject_id"),
                 payload.get("interaction_type"),
+                payload.get("namespace_key"),
                 payload.get("source_type"),
                 payload.get("session_id"),
                 payload["text"],

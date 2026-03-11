@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable
 
+from aimemory.core.facade import AIMemory
 from aimemory.core.utils import json_dumps, json_loads, make_id, utcnow_iso
 from aimemory.domains.object.models import StoredObject
 
@@ -12,17 +13,68 @@ class ServiceBase:
         self.projection = projection
         self.config = config
         self.object_store = object_store
+        self._kernel_instance: AIMemory | None = None
 
-    def _deserialize_row(self, row: dict[str, Any] | None, json_fields: Iterable[str] = ("metadata",)) -> dict[str, Any] | None:
+    def _kernel(self) -> AIMemory:
+        if self._kernel_instance is None:
+            self._kernel_instance = AIMemory(self.config)
+        return self._kernel_instance
+
+    def _deserialize_row(
+        self,
+        row: dict[str, Any] | None,
+        json_fields: Iterable[str] = (
+            "metadata",
+            "active_window",
+            "payload",
+            "snapshot",
+            "arguments",
+            "result",
+            "config",
+            "input_payload",
+            "expected_output",
+            "highlights",
+            "constraints",
+            "resolved_items",
+            "unresolved_items",
+            "next_actions",
+            "salience_vector",
+            "capability_tags",
+            "tool_affinity",
+        ),
+    ) -> dict[str, Any] | None:
         if row is None:
             return None
         item = dict(row)
         for field in json_fields:
             if field in item:
-                item[field] = json_loads(item.get(field), {})
+                fallback: Any = [] if field.endswith("s") or field in {"highlights", "constraints", "resolved_items", "unresolved_items", "next_actions", "salience_vector", "capability_tags", "tool_affinity"} else {}
+                item[field] = json_loads(item.get(field), fallback)
         return item
 
-    def _deserialize_rows(self, rows: list[dict[str, Any]], json_fields: Iterable[str] = ("metadata",)) -> list[dict[str, Any]]:
+    def _deserialize_rows(
+        self,
+        rows: list[dict[str, Any]],
+        json_fields: Iterable[str] = (
+            "metadata",
+            "active_window",
+            "payload",
+            "snapshot",
+            "arguments",
+            "result",
+            "config",
+            "input_payload",
+            "expected_output",
+            "highlights",
+            "constraints",
+            "resolved_items",
+            "unresolved_items",
+            "next_actions",
+            "salience_vector",
+            "capability_tags",
+            "tool_affinity",
+        ),
+    ) -> list[dict[str, Any]]:
         return [self._deserialize_row(row, json_fields) for row in rows if row is not None]
 
     def _persist_object(self, stored: StoredObject, mime_type: str | None = None, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -53,3 +105,11 @@ class ServiceBase:
             ),
         )
         return self._deserialize_row(self.db.fetch_one("SELECT * FROM objects WHERE id = ?", (object_id,)))
+
+    def close(self) -> None:
+        if self._kernel_instance is not None:
+            try:
+                self._kernel_instance.close()
+            except Exception:
+                pass
+            self._kernel_instance = None

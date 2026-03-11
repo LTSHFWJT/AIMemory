@@ -20,6 +20,11 @@ class MemoryScopeContext:
     subject_type: str | None = None
     subject_id: str | None = None
     interaction_type: str | None = None
+    platform_id: str | None = None
+    workspace_id: str | None = None
+    team_id: str | None = None
+    project_id: str | None = None
+    namespace_key: str | None = None
     session_id: str | None = None
     run_id: str | None = None
     actor_id: str | None = None
@@ -35,6 +40,11 @@ class MemoryScopeContext:
                 "subject_type": self.subject_type,
                 "subject_id": self.subject_id,
                 "interaction_type": self.interaction_type,
+                "platform_id": self.platform_id,
+                "workspace_id": self.workspace_id,
+                "team_id": self.team_id,
+                "project_id": self.project_id,
+                "namespace_key": self.namespace_key,
                 "session_id": self.session_id,
                 "run_id": self.run_id,
                 "actor_id": self.actor_id,
@@ -51,6 +61,11 @@ class MemoryScopeContext:
             "subject_type": self.subject_type,
             "subject_id": self.subject_id,
             "interaction_type": self.interaction_type,
+            "platform_id": self.platform_id,
+            "workspace_id": self.workspace_id,
+            "team_id": self.team_id,
+            "project_id": self.project_id,
+            "namespace_key": self.namespace_key,
             "session_id": self.session_id,
             "run_id": self.run_id,
             "actor_id": self.actor_id,

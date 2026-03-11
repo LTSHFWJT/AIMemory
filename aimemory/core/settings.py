@@ -66,6 +66,10 @@ class AIMemoryConfig:
     sqlite_path: str | Path | None = None
     object_store_path: str | Path | None = None
     default_user_id: str = "default"
+    platform_id: str | None = None
+    workspace_id: str | None = None
+    team_id: str | None = None
+    project_id: str | None = None
     auto_project: bool = True
     session_ttl_seconds: int = 60 * 60 * 24
     projection_batch_size: int = 100
