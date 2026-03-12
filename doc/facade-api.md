@@ -1,34 +1,27 @@
 # AIMemory Facade API
 
-本文档聚焦 `AIMemory` / `ScopedAIMemory` / `AsyncAIMemory` 这组对外主入口。
+本文档只保留 `AIMemory` 当前推荐的 Facade 用法。
 
-如果你只想接一个 API 层，优先看这份文档。
+如果你只关心怎么接入，请看这份；如果你需要完整参数与返回结构，请看 `doc/API_REFERENCE.md`。
 
-## 1.1 推荐的收敛调用方式
+## 1. 推荐接口面
 
-当前推荐优先使用分组入口：
+当前只推荐使用以下入口：
 
-- `memory.api.long_term.*`
-- `memory.api.short_term.*`
-- `memory.api.knowledge.*`
-- `memory.api.skill.*`
-- `memory.api.archive.*`
-- `memory.api.session.*`
-- `memory.api.recall.*`
+- `AIMemory.api.*`
+- `ScopedAIMemory.api.*`
+- `AsyncAIMemory.api.*`
 
-其中 `ScopedAIMemory` 对应 `scoped.api.*`。
+统一分组如下：
 
-详细参数、返回结构与调用示例请直接看 `doc/API_REFERENCE.md`。
-本文件以下内容更适合作为底层实现说明，不再代表推荐对外接口面。
-
-## 1. 什么时候用 Facade
-
-推荐直接使用 Facade 的场景：
-
-- 你要接的是业务应用，而不是底层存储框架
-- 你需要统一写入记忆、知识、技能、归档
-- 你希望直接做跨域查询
-- 你要适配团队多智能体协同平台
+- `api.long_term`
+- `api.short_term`
+- `api.knowledge`
+- `api.skill`
+- `api.archive`
+- `api.session`
+- `api.recall`
+- `api.execution`
 
 ## 2. `AIMemory`
 
@@ -46,306 +39,160 @@ memory = AIMemory(
 )
 ```
 
-`AIMemory(config=None)` 中最常用的配置项：
+最常用配置：
 
 | 配置项 | 说明 |
 | --- | --- |
-| `root_dir` | 所有本地数据根目录 |
-| `workspace_id` / `team_id` / `project_id` | 团队协同作用域默认值 |
-| `index_backend` | 向量后端名 |
-| `graph_backend` | 图后端名 |
-| `providers` | LiteLLM 风格 provider 配置 |
+| `root_dir` | 本地数据根目录 |
+| `workspace_id` / `team_id` / `project_id` | 团队作用域默认值 |
+| `index_backend` | 向量后端 |
+| `graph_backend` | 图后端 |
+| `providers` | LiteLLM 风格配置 |
 | `embeddings` | 嵌入配置 |
-| `memory_policy` | 压缩 / 检索 / 去重策略 |
+| `memory_policy` | 压缩、检索、去重策略 |
 
----
+### 2.2 最小示例
 
-### 2.2 记忆写入 API
+```python
+from aimemory import AIMemory
 
-#### `add(messages, **kwargs)`
+with AIMemory({"root_dir": ".aimemory-demo"}) as memory:
+    session = memory.api.session.create(
+        user_id="user-1",
+        owner_agent_id="agent.assistant",
+        subject_type="human",
+        subject_id="user-1",
+        interaction_type="human_agent",
+        title="demo",
+    )
 
-从消息列表中自动抽取候选记忆并写入。
+    memory.api.session.append(
+        session["id"],
+        "user",
+        "我喜欢简洁、分点、低 token 的回答。",
+    )
+
+    memory.api.long_term.add(
+        "用户偏好简洁分点输出。",
+        owner_agent_id="agent.assistant",
+        subject_type="human",
+        subject_id="user-1",
+        interaction_type="human_agent",
+        memory_type="preference",
+        importance=0.9,
+    )
+
+    memory.api.knowledge.add(
+        "平台规则",
+        "先查知识库，再决定是否访问外部资源。",
+        global_scope=True,
+    )
+
+    result = memory.api.recall.query(
+        "用户喜欢什么输出风格？",
+        owner_agent_id="agent.assistant",
+        subject_type="human",
+        subject_id="user-1",
+        session_id=session["id"],
+        domains=["memory", "knowledge"],
+        limit=8,
+    )
+
+    print(result["results"])
+```
+
+### 2.3 根对象常用方法
+
+| 方法 | 说明 |
+| --- | --- |
+| `api` | 当前唯一推荐调用入口 |
+| `scoped(**scope_kwargs)` | 创建固定作用域句柄 |
+| `create_mcp_adapter(scope=None)` | 创建 MCP 适配器 |
+| `storage_layout(**scope_kwargs)` | 查看当前存储布局 |
+| `describe_capabilities()` | 查看能力清单 |
+| `litellm_config()` | 导出 LiteLLM 风格配置 |
+| `register_domain_compressor(domain, compressor)` | 注册压缩器 |
+| `project(limit=None)` | 重建索引 |
+| `close()` | 关闭实例 |
+
+## 3. 分组 API
+
+### 3.1 记忆
+
+| 分组 | 适用场景 |
+| --- | --- |
+| `api.long_term` | 跨会话稳定记忆 |
+| `api.short_term` | 会话内短期上下文 |
+
+常用方法：
+
+- `add()`
+- `get()`
+- `list()`
+- `search()`
+- `update()`
+- `delete()`
+- `compress()`
+
+推荐原则：
+
+- 长期记忆写稳定偏好、事实、长期经验
+- 短期记忆写当前会话中的关键上下文
+
+### 3.2 知识、技能、归档
+
+| 分组 | 适用场景 |
+| --- | --- |
+| `api.knowledge` | 先查证据再回答 |
+| `api.skill` | 开始执行前先查已有技能 |
+| `api.archive` | 低频但长期保留的冷数据 |
+
+这三个分组统一使用以下方法形态：
+
+- `add()`
+- `get()`
+- `list()`
+- `search()`
+- `update()`
+- `delete()`
+
+其中 `api.archive` 额外提供：
+
+- `compress()`
+
+### 3.3 会话
+
+`api.session` 用于管理对话上下文与会话治理。
+
+常用方法：
+
+- `create()`
+- `get()`
+- `append()`
+- `compress()`
+- `promote()`
+- `health()`
+- `prune()`
+- `archive()`
+- `govern()`
+
+推荐做法：
+
+- 所有对话消息先写 `api.session.append()`
+- 会话变长后调用 `api.session.compress()`
+- 会话结束后根据需要调用 `api.session.promote()` 或 `api.session.archive()`
+
+### 3.4 统一召回
+
+`api.recall.query()` 是当前最推荐的统一读接口。
 
 适合：
 
-- 从完整会话片段做智能提取
-- 不想手写每条记忆
-
-常见参数：
-
-| 参数 | 说明 |
-| --- | --- |
-| `messages` | 消息列表或单条消息 |
-| `user_id` | 用户 ID |
-| `session_id` | 会话 ID |
-| `owner_agent_id` | 记忆所有者 agent |
-| `subject_type` / `subject_id` | 主体信息 |
-| `interaction_type` | 交互类型 |
-| `long_term` | 是否直接入长期记忆 |
-| `infer` | 是否启用蒸馏式抽取 |
-| `memory_type` | 记忆类型 |
-
-#### `remember_long_term(text, **kwargs)`
-
-直接写长期记忆。
-
-#### `remember_short_term(text, **kwargs)`
-
-直接写短期记忆。
-
-#### `memory_store(text, **kwargs)`
-
-统一存储入口，内部根据 `long_term` 决定写入长短期域。
-
----
-
-### 2.3 记忆查询与维护 API
-
-#### `memory_search(query, **kwargs)`
-
-只查记忆域。
-
-常见参数：
-
-| 参数 | 说明 |
-| --- | --- |
-| `query` | 查询文本 |
-| `user_id` | 用户 ID |
-| `owner_agent_id` | agent 作用域 |
-| `subject_type` / `subject_id` | 主体范围 |
-| `interaction_type` | 交互类型 |
-| `session_id` | 会话 ID |
-| `scope` | `all` / `session` / `long-term` |
-| `limit` | 返回条数 |
-| `threshold` | 最小得分阈值 |
-
-#### `memory_list(**kwargs)`
-
-列出符合范围的记忆记录。
-
-#### `memory_get(memory_id)`
-
-读取单条记忆。
-
-#### `update(memory_id, **kwargs)`
-
-更新记忆文本、重要度、状态、元数据。
-
-#### `delete(memory_id)`
-
-删除单条记忆并清理索引。
-
-#### `memory_forget(...)`
-
-支持：
-
-- 按 `memory_id` 删除
-- 按查询结果批量删除
-
-#### `history(memory_id)`
-
-查看记忆事件历史，例如：
-
-- `ADD`
-- `MERGE`
-- `DUPLICATE_TOUCH`
-- `UPDATE`
-- `DELETE`
-- `ARCHIVE`
-
----
-
-### 2.4 会话与上下文 API
-
-#### `create_session(**kwargs)`
-
-创建会话。
-
-最常用参数：
-
-| 参数 | 说明 |
-| --- | --- |
-| `user_id` | 用户 ID |
-| `owner_agent_id` | 拥有该会话的 agent |
-| `subject_type` / `subject_id` | 会话主体 |
-| `interaction_type` | `human_agent` / `agent_agent` |
-| `title` | 标题 |
-| `ttl_seconds` | TTL |
-| `metadata` | 附加信息 |
-
-#### `append_turn(session_id, role, content, **kwargs)`
-
-向会话追加一轮消息。
-
-额外支持：
-
-- 参与者 ID
-- speaker / target 类型与外部 ID
-- `turn_type`
-- `salience_score`
-- `run_id`
-
-#### `compress_session_context(session_id, **kwargs)`
-
-生成 working memory snapshot，压缩旧轮次上下文。
-
-#### `promote_session_memories(session_id, **kwargs)`
-
-从会话短期记忆中筛选高价值内容，晋升到长期记忆。
-
-#### `session_health(session_id)`
-
-查看当前会话状态，例如：
-
-- turn 数量
-- snapshot 情况
-- 最近更新时间
-
-#### `get_snapshot(snapshot_id)`
-
-读取单个压缩快照。
-
-#### `prune_session_snapshots(session_id)`
-
-删除旧快照，保留最近若干条。
-
-#### `govern_session(session_id, **kwargs)`
-
-组合治理入口，会同时尝试：
-
-- 健康检查
-- 压缩
-- 晋升
-- snapshot 清理
-
----
-
-### 2.5 知识库 API
-
-#### `ingest_document(title, text, **kwargs)`
-
-写入知识文档。
-
-支持范围：
-
-- `user_id`
-- `owner_agent_id`
-- `subject_type` / `subject_id`
-- `source_name` / `source_type`
-- `uri`
-- `kb_namespace`
-- `chunk_size`
-- `chunk_overlap`
-
-写入后会自动：
-
-- 建立 `documents`
-- 建立 `document_versions`
-- 建立 `document_chunks`
-- 建立 `knowledge_chunk_index`
-
-#### `ingest_knowledge(title, text, **kwargs)`
-
-`ingest_document` 的别名。
-
-#### `get_document(document_id)`
-
-返回：
-
-- 文档元数据
-- 版本列表
-- chunk 列表
-
-#### `search_knowledge(query, **kwargs)`
-
-在知识库范围做检索。
-
----
-
-### 2.6 技能 API
-
-#### `save_skill(name, description, **kwargs)`
-
-保存或更新技能。
-
-支持内容：
-
-- `version`
-- `prompt_template`
-- `workflow`
-- `schema`
-- `tools`
-- `tests`
-- `topics`
-- `metadata`
-
-#### `register_skill(name, description, **kwargs)`
-
-`save_skill` 的别名。
-
-#### `get_skill(skill_id)`
-
-读取完整技能对象，包括版本。
-
-#### `list_skills(status=None)`
-
-按状态列出技能。
-
-#### `search_skills(query, **kwargs)`
-
-在技能索引中搜索。
-
----
-
-### 2.7 归档 API
-
-#### `archive_memory(memory_id, **kwargs)`
-
-把单条记忆归档成摘要 + 对象存储 payload。
-
-#### `archive_session(session_id, **kwargs)`
-
-把整个会话归档。
-
-返回通常包括：
-
-- `archive`
-- `compression`
-
-#### `get_archive_unit(archive_unit_id)`
-
-读取归档单元及其摘要列表。
-
-#### `search_archive(query, **kwargs)`
-
-在归档摘要上做检索。
-
----
-
-### 2.8 执行过程 API
-
-#### `start_run(user_id=None, goal="", **kwargs)`
-
-创建执行 run。
-
-适合：
-
-- 记录 Agent 任务链
-- 保存工具调用与观察
-
-#### `search_execution(query, **kwargs)`
-
-搜索 run / observation 等执行记录。
-
----
-
-### 2.9 统一查询 API
-
-#### `query(query, **kwargs)`
-
-这是最推荐的统一召回入口。
-
-可跨域联合搜索：
+- 同时查记忆、知识、技能、归档
+- 让 Agent 在执行前先拼好证据上下文
+- 避免业务层自己做多次检索再手动合并
+
+可选 `domains`：
 
 - `memory`
 - `interaction`
@@ -354,79 +201,20 @@ memory = AIMemory(
 - `archive`
 - `execution`
 
-常用参数：
+`api.recall.explain()` 用于查看召回策略和路由解释。
 
-| 参数 | 说明 |
-| --- | --- |
-| `query` | 查询文本 |
-| `domains` | 限定域列表 |
-| `limit` | 返回条数 |
-| `threshold` | 最小分数 |
-| `filters` | 额外结果过滤 |
-| `owner_agent_id` | agent 作用域 |
-| `subject_type` / `subject_id` | 主体作用域 |
-| `workspace_id` / `team_id` / `project_id` | 团队作用域 |
-| `namespace_key` | 手动指定 namespace |
+### 3.5 执行记录
 
-#### `explain_recall(query, **kwargs)`
+`api.execution` 目前主要提供：
 
-在查询结果基础上，补充当前策略信息：
+- `start_run()`
+- `search()`
 
-- 向量后端
-- 图后端
-- rerank 参数
-- scan limit
+适合保存 run 级目标与后续回查。
 
----
+## 4. `ScopedAIMemory`
 
-### 2.10 系统能力 API
-
-#### `describe_capabilities()`
-
-返回：
-
-- `core`
-- `embeddings`
-- `vector_index`
-- `graph_store`
-- `algorithms`
-- `mcp`
-
-#### `storage_layout(**scope_kwargs)`
-
-返回当前作用域下的存储布局。
-
-适合：
-
-- 调试 namespace
-- 平台可观测性
-- 校验不同域的对象前缀
-
-#### `project(limit=None)`
-
-重建 / 投影索引。
-
-#### `litellm_config()`
-
-返回 LiteLLM 风格 provider 配置。
-
----
-
-## 3. `ScopedAIMemory`
-
-### 3.1 为什么存在
-
-当你在固定作用域下反复调用 Facade 时，不想每次都传：
-
-- `owner_agent_id`
-- `subject_type`
-- `subject_id`
-- `interaction_type`
-- `workspace_id`
-- `team_id`
-- `project_id`
-
-这时应该用：
+当你在固定 scope 下频繁调用时，优先使用 `scoped()`：
 
 ```python
 scoped = memory.scoped(
@@ -437,82 +225,77 @@ scoped = memory.scoped(
     subject_id="agent.executor",
     interaction_type="agent_agent",
 )
+
+scoped.api.long_term.add("executor 擅长把长计划压缩成可执行步骤。")
+result = scoped.api.recall.query("executor 擅长什么", domains=["memory", "skill"])
 ```
 
-### 3.2 常用方法
+`ScopedAIMemory` 公开能力：
 
-`ScopedAIMemory` 复用了主 Facade 的核心方法：
+| 方法 | 说明 |
+| --- | --- |
+| `api` | 自动携带默认 scope |
+| `using(**scope_overrides)` | 基于当前 scope 派生新 scope |
+| `scope_dict()` | 返回当前 scope |
+| `storage_layout()` | 查看当前 scope 的存储布局 |
+| `create_mcp_adapter()` | 创建带默认 scope 的 MCP adapter |
 
-- `add`
-- `create_session`
-- `append_turn`
-- `remember_long_term`
-- `remember_short_term`
-- `memory_search`
-- `query`
-- `ingest_document`
-- `search_knowledge`
-- `save_skill`
-- `search_skills`
-- `archive_session`
-- `search_archive`
-- `search_interaction`
-- `search_execution`
-- `compress_session_context`
-- `storage_layout`
-- `create_mcp_adapter`
+## 5. `AsyncAIMemory`
 
-### 3.3 继续叠加作用域
-
-可以用 `using(...)` 进一步细化：
+异步场景直接使用：
 
 ```python
-executor_scope = scoped.using(subject_id="agent.executor.v2")
+from aimemory import AsyncAIMemory
+
+memory = AsyncAIMemory({"root_dir": ".aimemory-async"})
+await memory.api.long_term.add("异步入口也使用同一组 Facade API。")
+await memory.close()
 ```
 
----
+推荐场景：
 
-## 4. `AsyncAIMemory`
+- 异步 Web 服务
+- 异步 Agent Runtime
+- 统一用 `await` 风格组织接入层
 
-`AsyncAIMemory` 是 `AIMemory` 的异步包装版本。
+## 6. MCP Adapter
 
-适合：
+如果要把能力暴露给上层 Agent，用：
 
-- 异步 web 服务
-- 异步 Agent runtime
-- 需要 `await` 风格调用的应用层
+```python
+adapter = memory.create_mcp_adapter(
+    scope={
+        "workspace_id": "ws.alpha",
+        "team_id": "team.memory",
+        "owner_agent_id": "agent.planner",
+    }
+)
+```
 
-使用建议：
+常见工具：
 
-- 业务逻辑尽量仍按同步 Facade 思维组织
-- 仅在接入层换成 `AsyncAIMemory`
+- `recall_query`
+- `long_term_memory_*`
+- `short_term_memory_*`
+- `knowledge_document_*`
+- `skill_*`
+- `archive_memory_*`
+- `session_*`
+- `aimemory_manifest`
 
----
+## 7. 推荐接入顺序
 
-## 5. 推荐实践
+1. 初始化 `AIMemory`
+2. 如有固定作用域，先 `memory.scoped(...)`
+3. 先查 `api.skill.search()` / `api.knowledge.search()`
+4. 用 `api.session.*` 管理会话
+5. 用 `api.long_term` / `api.short_term` 管理记忆
+6. 用 `api.recall.query()` 做统一召回
+7. 用 `api.archive` 或 `api.session.archive()` 做冷存储
+8. 需要工具化时接 `create_mcp_adapter()`
 
-### 实践 1：团队场景优先用 scoped facade
+## 8. 更多细节
 
-这能显著降低跨团队、跨 workspace 误查风险。
+完整参数、返回结构、字段范围说明，请看：
 
-### 实践 2：统一召回优先用 `query()`
-
-如果不是只查某一个域，优先使用 `query()` 而不是自己拼多次搜索。
-
-### 实践 3：记忆与知识分开写
-
-- 记忆存“跟当前主体长期相关的事实”
-- 知识库存“文档化、块化内容”
-
-### 实践 4：技能单独维护
-
-技能更偏：
-
-- 方法
-- 流程
-- Prompt 模板
-- 工具组合
-
-### 实践 5：定期压缩与归档
-
-这样能持续降低上下文成本，同时保留可检索线索。
+- `doc/API_REFERENCE.md`
