@@ -206,6 +206,13 @@ pip install .[all]
 
 来区分人-agent、agent-agent 两类交互，并对不同主体与不同 agent 做隔离。
 
+其中部分参数存在固定枚举值或推荐约定值，例如：
+
+- `subject_type`：推荐 `human` / `agent`
+- `interaction_type`：推荐 `human_agent` / `agent_agent`
+- `memory_type`：固定值见 `doc/API_REFERENCE.md`
+- `domains`：固定值见 `doc/API_REFERENCE.md`
+
 ### 0.1 数据库插件接入
 
 关系型存储默认走本地 `SQLite`，也支持插件注册：

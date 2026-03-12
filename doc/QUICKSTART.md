@@ -91,6 +91,8 @@ memory = AIMemory(
 
 旧的平铺方法不再作为对外接口，统一使用 `memory.api.*` / `scoped.api.*`。
 
+涉及 `subject_type`、`interaction_type`、`memory_type`、`domains`、`status` 等取值时，请以 `doc/API_REFERENCE.md` 中的枚举与约定说明为准。
+
 ## 3. 写入长期记忆
 
 ```python

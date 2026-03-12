@@ -98,6 +98,38 @@ print(result["results"])
 - 团队平台下，优先固定 `workspace_id` / `team_id` / `project_id`
 - 不要把不同主体写进同一组 scope
 
+### 3.1 严格枚举值
+
+以下字段在代码中有明确枚举定义，文档按固定值说明：
+
+| 字段 | 固定值 |
+| --- | --- |
+| `memory_type` | `semantic`、`episodic`、`procedural`、`profile`、`preference`、`relationship_summary` |
+| `skill.status` | `draft`、`active`、`deprecated`、`archived` |
+| `run.status` | `pending`、`running`、`completed`、`failed`、`cancelled` |
+| `task.status` | `pending`、`running`、`completed`、`failed`、`skipped` |
+| `session.status` | `active`、`idle`、`archived`、`closed` |
+| `archive` 内置域值 | `session`、`memory`、`document`、`run` |
+| `knowledge` 内置来源类型 | `manual`、`directory`、`url`、`git` |
+
+### 3.2 推荐约定值
+
+以下字段在实现里不是强制枚举，但主流程明显依赖这些约定值，建议严格按下列值传：
+
+| 字段 | 推荐值 | 说明 |
+| --- | --- | --- |
+| `subject_type` | `human`、`agent` | 会影响主体推断、参与者绑定与隔离逻辑 |
+| `interaction_type` | `human_agent`、`agent_agent` | 会影响默认作用域与检索行为 |
+| `speaker_type` / `target_type` | `human`、`agent` | 会影响会话参与者自动绑定 |
+| `role` | `user`、`human`、`assistant`、`peer_agent`、`system`、`tool` | 其中 `user`/`human`/`peer_agent` 会触发不同的默认参与者推断 |
+| `domains` | `memory`、`interaction`、`knowledge`、`skill`、`archive`、`execution` | 统一召回支持的域列表 |
+
+补充说明：
+
+- `turn_type` 不是固定枚举，当前默认值是 `message`，可按业务扩展
+- `knowledge.source_type` 与 `archive.domain` 虽有内置值，但当前实现也允许自定义字符串
+- `knowledge.add()` 入口默认 `source_type="inline"`，这是 facade 层的默认写入值，属于可扩展字符串
+
 ## 4. 通用可选参数
 
 | 参数 | 适用方法 | 含义 | 推荐范围 |
@@ -114,7 +146,7 @@ print(result["results"])
 | `include_inactive` | memory list | 是否包含非 active 记录 | `True` / `False` |
 | `force` | compress | 是否强制压缩 | `True` / `False` |
 | `budget_chars` | session/archive compress | 压缩预算字符数 | `> 0` |
-| `status` | knowledge/skill update/list | 状态字段 | 见对应枚举 |
+| `status` | knowledge/skill/run update/list | 状态字段 | skill/run 用固定枚举；knowledge 当前默认 `active`，允许扩展字符串 |
 
 ## 5. 根对象
 
@@ -202,7 +234,7 @@ await memory.close()
 | `delete(memory_id)` | 删除长期记忆 | `memory_id` |
 | `compress(**kwargs)` | 压缩长期记忆 | `force`、`limit`、作用域参数 |
 
-`memory_type` 常见值：
+`memory_type` 固定枚举值：
 
 - `semantic`
 - `episodic`
@@ -243,13 +275,17 @@ await memory.close()
 | `update(document_id, **kwargs)` | 更新文档 | `title`、`text`、`status`、`metadata`、`kb_namespace`、`global_scope`、作用域参数 |
 | `delete(document_id)` | 删除文档 | `document_id` |
 
-`source_type` 常见值：
+`source_type` 内置值：
 
 - `manual`
 - `directory`
 - `url`
 - `git`
-- 也可传业务自定义字符串
+
+补充：
+
+- `api.knowledge.add()` 的默认值是 `inline`
+- 除内置值外，也允许传业务自定义字符串
 
 ## 9. `api.skill`
 
@@ -264,7 +300,7 @@ await memory.close()
 | `update(skill_id, **kwargs)` | 更新技能并可写入新版本 | `name`、`description`、`version`、`prompt_template`、`workflow`、`schema`、`tools`、`tests`、`topics`、`metadata`、`status`、作用域参数 |
 | `delete(skill_id)` | 删除技能 | `skill_id` |
 
-`status` 常见值：
+`status` 固定枚举值：
 
 - `draft`
 - `active`
@@ -291,6 +327,12 @@ await memory.close()
 - 低频但不能丢失的规则/经验
 - 需要低成本唤起的历史结论
 
+`domain` 补充说明：
+
+- 系统内置归档域值是 `session`、`memory`、`document`、`run`
+- `api.archive.add()` 的默认值是 `manual`
+- 当前实现允许自定义字符串
+
 ## 11. `api.session`
 
 会话 API 负责短期上下文与交互事件。
@@ -309,8 +351,11 @@ await memory.close()
 
 补充说明：
 
-- `role` 常见取值：`user`、`assistant`、`system`、`tool`、`peer_agent`
-- `turn_type` 默认 `message`
+- `subject_type` 推荐固定传 `human` 或 `agent`
+- `interaction_type` 推荐固定传 `human_agent` 或 `agent_agent`
+- `role` 推荐使用 `user`、`human`、`assistant`、`peer_agent`、`system`、`tool`
+- `speaker_type` / `target_type` 推荐固定传 `human` 或 `agent`
+- `turn_type` 默认 `message`，当前不是固定枚举
 - `ttl_seconds` 建议传正整数
 
 ## 12. `api.recall`
@@ -322,7 +367,7 @@ await memory.close()
 | `query(query, **kwargs)` | 跨域统一召回 | `query`、作用域参数、`session_id`、`run_id`、`domains`、`filters`、`limit`、`threshold` |
 | `explain(query, **kwargs)` | 返回路由解释 | `query`、作用域参数、`session_id` |
 
-`domains` 常见取值：
+`domains` 固定可选值：
 
 - `memory`
 - `interaction`
@@ -343,16 +388,26 @@ await memory.close()
 
 | 方法 | 用途 | 主要参数 |
 | --- | --- | --- |
-| `start_run(user_id=None, goal="", **kwargs)` | 创建 run | `user_id`、`goal`、作用域参数、`session_id`、`metadata` |
+| `start_run(user_id=None, goal="", **kwargs)` | 创建 run | `user_id`、`goal`、作用域参数、`session_id`、`metadata`、`status` |
 | `search(query, **kwargs)` | 搜索执行记录 | `query`、`user_id`、`owner_agent_id`、`session_id`、团队作用域参数、`limit`、`threshold`、`filters` |
 
-`RunStatus` 常见值：
+`RunStatus` 固定枚举值：
 
 - `pending`
 - `running`
 - `completed`
 - `failed`
 - `cancelled`
+
+调用 `api.execution.start_run(..., status=...)` 时，建议严格使用以上固定值。
+
+`TaskStatus` 固定枚举值：
+
+- `pending`
+- `running`
+- `completed`
+- `failed`
+- `skipped`
 
 ## 14. MCP Adapter
 
