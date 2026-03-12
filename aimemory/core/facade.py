@@ -20,7 +20,7 @@ from aimemory.providers.defaults import TextOnlyVisionProcessor
 from aimemory.providers.embeddings import configure_embedding_runtime, describe_embedding_runtime, embed_text
 from aimemory.querying.filters import filter_records
 from aimemory.storage.object_store.local import LocalObjectStore
-from aimemory.storage.sqlite.database import SQLiteDatabase
+from aimemory.storage.plugins import STORAGE_PLUGIN_REGISTRY
 from aimemory.storage.sqlite.runtime_schema import ADDITIONAL_COLUMNS, EXTRA_SCHEMA_STATEMENTS, POST_MIGRATION_SCHEMA_STATEMENTS
 
 
@@ -83,7 +83,7 @@ class AIMemory:
     def __init__(self, config: AIMemoryConfig | dict[str, Any] | None = None):
         self.config = AIMemoryConfig.from_value(config)
         configure_embedding_runtime(self.config.embeddings)
-        self.db = SQLiteDatabase(self.config.sqlite_path)
+        self.db = STORAGE_PLUGIN_REGISTRY.create_relational(self.config.relational_backend, self.config)
         self._ensure_runtime_schema()
         self.object_store = LocalObjectStore(self.config.object_store_path)
         BACKEND_REGISTRY.bootstrap_defaults()
@@ -91,6 +91,8 @@ class AIMemory:
         self.graph_store = BACKEND_REGISTRY.create_graph(self._resolve_graph_backend_name(), db=self.db, config=self.config)
         self.normalizer = TextOnlyVisionProcessor()
         self.distiller = AdaptiveDistiller(self.config.memory_policy)
+        self._domain_compressors: dict[str, Callable[..., Any]] = {}
+        self._agent_store_api = None
         self._closed = False
 
     def _ensure_runtime_schema(self) -> None:
@@ -279,6 +281,11 @@ class AIMemory:
         subject_id: str | None = None,
         interaction_type: str | None = None,
         session_id: str | None = None,
+        platform_id: str | None = None,
+        workspace_id: str | None = None,
+        team_id: str | None = None,
+        project_id: str | None = None,
+        namespace_key: str | None = None,
         scope: str = "all",
         limit: int = 100,
         offset: int = 0,
@@ -304,6 +311,21 @@ class AIMemory:
         if interaction_type:
             sql_filters.append("(interaction_type = ? OR interaction_type IS NULL)")
             params.append(interaction_type)
+        namespace_filter = self._namespace_filter_value(
+            user_id=user_id,
+            owner_agent_id=owner_agent_id,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            interaction_type=interaction_type,
+            platform_id=platform_id,
+            workspace_id=workspace_id,
+            team_id=team_id,
+            project_id=project_id,
+            namespace_key=namespace_key,
+        )
+        if namespace_filter:
+            sql_filters.append("namespace_key = ?")
+            params.append(namespace_filter)
         if scope == str(MemoryScope.SESSION):
             sql_filters.append("scope = ?")
             params.append(str(MemoryScope.SESSION))
@@ -899,6 +921,7 @@ class AIMemory:
         source_name = kwargs.pop("source_name", title)
         source_type = kwargs.pop("source_type", "inline")
         uri = kwargs.pop("uri", None)
+        global_scope = bool(kwargs.pop("global_scope", False))
         scope = self._resolve_scope(
             user_id=kwargs.pop("user_id", None),
             agent_id=kwargs.pop("agent_id", None),
@@ -911,6 +934,7 @@ class AIMemory:
             team_id=kwargs.pop("team_id", None),
             project_id=kwargs.pop("project_id", None),
             namespace_key=kwargs.pop("namespace_key", None),
+            global_scope=global_scope,
         )
         user_id = scope["user_id"]
         owner_agent_id = scope["owner_agent_id"]
@@ -1023,6 +1047,7 @@ class AIMemory:
         team_id: str | None = None,
         project_id: str | None = None,
         namespace_key: str | None = None,
+        include_global: bool = True,
         limit: int = 10,
         threshold: float = 0.0,
         filters: dict[str, Any] | None = None,
@@ -1030,10 +1055,16 @@ class AIMemory:
         sql_filters = ["d.status = 'active'"]
         params: list[Any] = []
         if user_id:
-            sql_filters.append("d.user_id = ?")
+            if include_global:
+                sql_filters.append("(d.user_id = ? OR d.user_id IS NULL)")
+            else:
+                sql_filters.append("d.user_id = ?")
             params.append(user_id)
         if owner_agent_id:
-            sql_filters.append("(d.owner_agent_id = ? OR d.owner_agent_id IS NULL)")
+            if include_global:
+                sql_filters.append("(d.owner_agent_id = ? OR d.owner_agent_id IS NULL)")
+            else:
+                sql_filters.append("d.owner_agent_id = ?")
             params.append(owner_agent_id)
         if subject_type:
             sql_filters.append("(d.source_subject_type = ? OR d.source_subject_type IS NULL)")
@@ -1053,7 +1084,10 @@ class AIMemory:
             namespace_key=namespace_key,
         )
         if namespace_filter:
-            sql_filters.append("d.namespace_key = ?")
+            if include_global:
+                sql_filters.append("(d.namespace_key = ? OR d.namespace_key = 'global')")
+            else:
+                sql_filters.append("d.namespace_key = ?")
             params.append(namespace_filter)
         rows = self.db.fetch_all(
             f"""
@@ -1532,6 +1566,7 @@ class AIMemory:
         team_id: str | None = None,
         project_id: str | None = None,
         namespace_key: str | None = None,
+        include_global: bool = True,
         limit: int = 10,
         threshold: float = 0.0,
         filters: dict[str, Any] | None = None,
@@ -1539,10 +1574,13 @@ class AIMemory:
         sql_filters = ["1 = 1"]
         params: list[Any] = []
         if user_id:
-            sql_filters.append("asi.user_id = ?")
-            params.append(user_id)
+            sql_filters.append("(asi.user_id = ? OR (? AND asi.user_id IS NULL))")
+            params.extend([user_id, 1 if include_global else 0])
         if owner_agent_id:
-            sql_filters.append("(asi.owner_agent_id = ? OR asi.owner_agent_id IS NULL)")
+            if include_global:
+                sql_filters.append("(asi.owner_agent_id = ? OR asi.owner_agent_id IS NULL)")
+            else:
+                sql_filters.append("asi.owner_agent_id = ?")
             params.append(owner_agent_id)
         if subject_type:
             sql_filters.append("(asi.subject_type = ? OR asi.subject_type IS NULL)")
@@ -1569,7 +1607,10 @@ class AIMemory:
             namespace_key=namespace_key,
         )
         if namespace_filter:
-            sql_filters.append("asi.namespace_key = ?")
+            if include_global:
+                sql_filters.append("(asi.namespace_key = ? OR asi.namespace_key = 'global')")
+            else:
+                sql_filters.append("asi.namespace_key = ?")
             params.append(namespace_filter)
         rows = self.db.fetch_all(
             f"""
@@ -2072,6 +2113,7 @@ class AIMemory:
                     "multi_domain_memory": True,
                     "agent_facing_mcp": True,
                     "team_scoped_namespace": True,
+                    "plugin_relational_storage": True,
                 },
             ),
             "embeddings": describe_embedding_runtime(),
@@ -2107,6 +2149,7 @@ class AIMemory:
                     "tools": [item["name"] for item in self.create_mcp_adapter().tool_specs()],
                     "litellm": self.config.providers.as_litellm_kwargs(),
                     "storage_layout": self.storage_layout(),
+                    "relational_backend": self.config.relational_backend,
                 },
             ),
         }
@@ -2121,8 +2164,101 @@ class AIMemory:
 
         return AIMemoryMCPAdapter(self, scope=scope)
 
+    @property
+    def agent_store(self):
+        if self._agent_store_api is None:
+            from aimemory.core.domain_api import AgentStoreAPI
+
+            self._agent_store_api = AgentStoreAPI(self)
+        return self._agent_store_api
+
     def litellm_config(self) -> dict[str, Any]:
         return self.config.providers.as_litellm_kwargs()
+
+    def register_domain_compressor(self, domain: str, compressor: Callable[..., Any]) -> None:
+        self._domain_compressors[str(domain)] = compressor
+
+    def unregister_domain_compressor(self, domain: str) -> None:
+        self._domain_compressors.pop(str(domain), None)
+
+    def compress_domain_records(
+        self,
+        domain: str,
+        records: list[dict[str, Any]],
+        *,
+        scope: dict[str, Any] | None = None,
+        threshold_chars: int,
+        budget_chars: int,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        total_chars = sum(len(str(item.get("text") or item.get("content") or item.get("summary") or "")) for item in records)
+        payload = {
+            "domain": str(domain),
+            "total_chars": int(total_chars),
+            "threshold_chars": int(threshold_chars),
+            "budget_chars": int(budget_chars),
+            "source_count": len(records),
+            "triggered": bool(force or total_chars > threshold_chars),
+        }
+        if not payload["triggered"] or not records:
+            return {
+                **payload,
+                "summary": "",
+                "highlights": [],
+                "kept_ids": [],
+                "estimated_tokens": 0,
+                "provider": "skipped",
+            }
+        compressor = self._domain_compressors.get(str(domain))
+        if compressor is None:
+            result = compress_records(
+                records,
+                budget_chars=budget_chars,
+                diversity_lambda=self.config.memory_policy.diversity_lambda,
+            )
+            normalized = result.as_dict()
+            provider = "local"
+        else:
+            external = compressor(
+                domain=str(domain),
+                records=list(records),
+                scope=dict(scope or {}),
+                threshold_chars=int(threshold_chars),
+                budget_chars=int(budget_chars),
+                memory=self,
+            )
+            if isinstance(external, CompressionResult):
+                normalized = external.as_dict()
+            elif isinstance(external, str):
+                normalized = compress_records(
+                    [{"id": item.get("id"), "text": external, "score": 1.0}],
+                    budget_chars=budget_chars,
+                    diversity_lambda=self.config.memory_policy.diversity_lambda,
+                ).as_dict()
+            elif isinstance(external, dict):
+                normalized = {
+                    "summary": str(external.get("summary") or ""),
+                    "highlights": list(external.get("highlights") or []),
+                    "kept_ids": list(external.get("kept_ids") or []),
+                    "estimated_tokens": int(external.get("estimated_tokens") or estimate_tokens(str(external.get("summary") or ""))),
+                    "source_count": int(external.get("source_count") or len(records)),
+                }
+            else:
+                raise TypeError("compressor must return CompressionResult, dict, or str")
+            provider = "external"
+        return {
+            **payload,
+            **normalized,
+            "provider": provider,
+        }
+
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        agent_store = self.agent_store
+        if hasattr(agent_store, name):
+            return getattr(agent_store, name)
+        raise AttributeError(name)
 
     def close(self) -> None:
         if self._closed:
@@ -2205,7 +2341,21 @@ class AIMemory:
         project_id: str | None = None,
         namespace_key: str | None = None,
         session: dict[str, Any] | None = None,
+        global_scope: bool = False,
     ) -> dict[str, str | None]:
+        if global_scope:
+            return {
+                "user_id": None,
+                "owner_agent_id": None,
+                "subject_type": None,
+                "subject_id": None,
+                "interaction_type": None,
+                "platform_id": None,
+                "workspace_id": None,
+                "team_id": None,
+                "project_id": None,
+                "namespace_key": namespace_key or "global",
+            }
         resolved_user_id = user_id or (session.get("user_id") if session else None) or self.config.default_user_id
         resolved_owner_agent_id = owner_agent_id or agent_id or (session.get("owner_agent_id") if session else None) or (session.get("agent_id") if session else None)
         resolved_subject_type = subject_type or (session.get("subject_type") if session else None)
@@ -2274,6 +2424,7 @@ class AIMemory:
         project_id: str | None = None,
         namespace_key: str | None = None,
         session: dict[str, Any] | None = None,
+        global_scope: bool = False,
     ) -> str | None:
         scope = self._resolve_scope(
             user_id=user_id,
@@ -2288,11 +2439,14 @@ class AIMemory:
             project_id=project_id,
             namespace_key=namespace_key,
             session=session,
+            global_scope=global_scope,
         )
         if namespace_key:
             return namespace_key
         if any(scope.get(key) for key in ("platform_id", "workspace_id", "team_id", "project_id")):
             return scope.get("namespace_key")
+        if global_scope:
+            return "global"
         return None
 
     def _object_store_prefix(self, scope: dict[str, Any], domain: str) -> str:
@@ -2302,6 +2456,7 @@ class AIMemory:
         scope = self._resolve_scope(**scope_kwargs)
         return {
             "scope": scope,
+            "relational_backend": self.config.relational_backend,
             "vector_backend": self._resolve_vector_backend_name(),
             "graph_backend": self._resolve_graph_backend_name(),
             "domains": {
@@ -2310,12 +2465,14 @@ class AIMemory:
                     "object_prefix": self._object_store_prefix(scope, "memory"),
                     "scope": str(MemoryScope.LONG_TERM),
                     "strategy": "dedupe + semantic distill + hybrid retrieval",
+                    "compression_threshold_chars": self.config.memory_policy.long_term_char_threshold,
                 },
                 "short_term_memory": {
                     "tables": ["conversation_turns", "working_memory_snapshots", "memories"],
                     "object_prefix": self._object_store_prefix(scope, "interaction"),
                     "scope": str(MemoryScope.SESSION),
                     "strategy": "session turns + salience compression + promotion",
+                    "compression_threshold_chars": self.config.memory_policy.short_term_char_threshold,
                 },
                 "knowledge": {
                     "tables": ["documents", "document_chunks", "knowledge_chunk_index"],
@@ -2331,6 +2488,7 @@ class AIMemory:
                     "tables": ["archive_units", "archive_summaries", "archive_summary_index"],
                     "object_prefix": self._object_store_prefix(scope, "archive"),
                     "strategy": "budget compression + low-cost summary retrieval",
+                    "compression_threshold_chars": self.config.memory_policy.archive_char_threshold,
                 },
             },
         }

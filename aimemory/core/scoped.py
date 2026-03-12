@@ -22,6 +22,16 @@ class ScopedAIMemory:
     def _payload(self, kwargs: dict[str, Any] | None = None) -> dict[str, Any]:
         return self.scope.apply_to_kwargs(kwargs)
 
+    def __getattr__(self, name: str):
+        target = getattr(self.memory, name)
+        if not callable(target):
+            return target
+
+        def wrapper(*args, **kwargs):
+            return target(*args, **self._payload(kwargs))
+
+        return wrapper
+
     def add(self, messages, **kwargs: Any) -> dict[str, Any]:
         return self.memory.add(messages, **self._payload(kwargs))
 

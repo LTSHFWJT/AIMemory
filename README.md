@@ -53,6 +53,7 @@
 
 ### 4. 易扩展
 
+- 关系型后端：默认 `SQLite`，可通过插件注册自定义实现
 - 向量后端：`sqlite` 回退 / `LanceDB` / `FAISS`
 - 图后端：`sqlite` 回退 / `Kuzu`
 - MCP 适配：内置工具描述与 `FastMCP` 绑定
@@ -176,6 +177,73 @@ pip install .[all]
 ```
 
 ## 快速开始
+
+### 0. 面向 Agent 的域级 API
+
+除原有 `remember_* / ingest_* / save_skill / archive_*` 入口外，`AIMemory` 现在直接提供更适合外部 Agent 调用的域级 API：
+
+- 长期记忆：`store_long_term_memory`、`get_long_term_memory`、`list_long_term_memories`、`search_long_term_memories`、`update_long_term_memory`、`delete_long_term_memory`、`compress_long_term_memories`
+- 短期记忆：`store_short_term_memory`、`get_short_term_memory`、`list_short_term_memories`、`search_short_term_memories`、`update_short_term_memory`、`delete_short_term_memory`、`compress_short_term_memories`
+- 归档记忆：`save_archive_memory`、`get_archive_memory`、`list_archive_memories`、`search_archive_memories`、`update_archive_memory`、`delete_archive_memory`、`compress_archive_memories`
+- 技能：`save_skill`、`get_skill_content`、`list_skill_metadata`、`search_skill_keywords`、`update_skill`、`delete_skill`
+- 知识库：`save_knowledge_document`、`get_knowledge_document`、`list_knowledge_documents`、`search_knowledge_documents`、`update_knowledge_document`、`delete_knowledge_document`
+
+这些接口会自动沿用：
+
+- `owner_agent_id`
+- `subject_type`
+- `subject_id`
+- `interaction_type`
+- `namespace_key`
+
+来区分人-agent、agent-agent 两类交互，并对不同主体与不同 agent 做隔离。
+
+### 0.1 数据库插件接入
+
+关系型存储默认走本地 `SQLite`，也支持插件注册：
+
+```python
+from aimemory import AIMemory, register_relational_backend
+from aimemory.storage.sqlite.database import SQLiteDatabase
+
+register_relational_backend("sqlite_alias", lambda config: SQLiteDatabase(config.sqlite_path))
+
+memory = AIMemory(
+    {
+        "root_dir": ".aimemory-demo",
+        "relational_backend": "sqlite_alias",
+    }
+)
+```
+
+向量与图后端也可分别通过：
+
+- `register_vector_backend(...)`
+- `register_graph_backend(...)`
+
+接入自定义实现。
+
+### 0.2 全局知识库与外部压缩钩子
+
+知识库与归档支持 `global_scope=True`，用于所有 agent 可访问的共享内容：
+
+```python
+memory.save_knowledge_document(
+    title="全局规则",
+    text="所有 agent 都必须优先检索本地知识库，再决定是否访问外部模型。",
+    global_scope=True,
+)
+```
+
+如果上层 Agent 想接管压缩，也可以注册域级压缩器：
+
+```python
+def custom_compressor(*, domain, records, budget_chars, **_):
+    text = " | ".join(item["text"] for item in records[:3])
+    return {"summary": text[:budget_chars], "highlights": [text[:budget_chars]]}
+
+memory.register_domain_compressor("long_term", custom_compressor)
+```
 
 ### 1. 最小可运行示例
 

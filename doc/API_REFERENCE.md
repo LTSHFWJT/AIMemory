@@ -19,6 +19,9 @@
 | `ProviderLiteConfig` | Dataclass | LiteLLM 风格 provider 配置 |
 | `EmbeddingLiteConfig` | Dataclass | 嵌入模型配置 |
 | `CollaborationScope` | Dataclass | 多智能体协作作用域模型 |
+| `register_relational_backend` | Function | 注册关系型数据库插件 |
+| `register_vector_backend` | Function | 注册向量数据库插件 |
+| `register_graph_backend` | Function | 注册图数据库插件 |
 
 ## 2. 配置对象
 
@@ -31,6 +34,7 @@
 | `root_dir` | `.aimemory` | 根目录 |
 | `sqlite_path` | 自动推导 | SQLite 文件路径 |
 | `object_store_path` | 自动推导 | 对象存储目录 |
+| `relational_backend` | `sqlite` | 关系型后端插件名 |
 | `default_user_id` | `default` | 默认用户 |
 | `platform_id` | `None` | 平台维度 |
 | `workspace_id` | `None` | 工作区维度 |
@@ -103,6 +107,40 @@
 
 ## 4. 顶层 Facade API 索引
 
+### 4.0 面向 Agent 的域级 API
+
+| 方法 | 说明 |
+| --- | --- |
+| `store_long_term_memory(...)` | 写入长期记忆并按阈值触发长期压缩 |
+| `get_long_term_memory(memory_id)` | 获取长期记忆 |
+| `list_long_term_memories(**kwargs)` | 列出指定 agent 与主体之间的完整长期记忆 |
+| `search_long_term_memories(query, **kwargs)` | 通过关键字快速检索长期记忆 |
+| `update_long_term_memory(memory_id, **kwargs)` | 更新长期记忆 |
+| `delete_long_term_memory(memory_id)` | 删除长期记忆 |
+| `compress_long_term_memories(**kwargs)` | 压缩长期记忆 |
+| `store_short_term_memory(...)` | 写入短期记忆并按阈值触发短期压缩 |
+| `list_short_term_memories(**kwargs)` | 列出完整短期记忆 |
+| `search_short_term_memories(query, **kwargs)` | 通过关键字快速检索短期记忆 |
+| `compress_short_term_memories(**kwargs)` | 压缩短期记忆；有会话时写入 snapshot |
+| `save_knowledge_document(...)` | 写入知识库文档，支持 `global_scope=True` |
+| `list_knowledge_documents(**kwargs)` | 列出知识库文档，支持全局知识库 |
+| `search_knowledge_documents(query, **kwargs)` | 检索知识库文档 |
+| `update_knowledge_document(document_id, **kwargs)` | 更新知识库文档 |
+| `delete_knowledge_document(document_id)` | 删除知识库文档 |
+| `get_skill_content(skill_id)` | 获取完整 skill 内容 |
+| `list_skill_metadata(**kwargs)` | 列出 skill metadata |
+| `search_skill_keywords(query, **kwargs)` | 通过关键字检索 skill |
+| `update_skill(skill_id, **kwargs)` | 更新 skill，并可追加新版本 |
+| `delete_skill(skill_id)` | 删除 skill |
+| `save_archive_memory(...)` | 手动新增归档记忆，支持全局归档 |
+| `list_archive_memories(**kwargs)` | 列出归档记忆 |
+| `search_archive_memories(query, **kwargs)` | 检索归档记忆 |
+| `update_archive_memory(archive_unit_id, **kwargs)` | 更新归档记忆 |
+| `delete_archive_memory(archive_unit_id)` | 删除归档记忆 |
+| `compress_archive_memories(**kwargs)` | 压缩归档记忆并生成低成本摘要 |
+| `register_domain_compressor(domain, compressor)` | 注册外部域级压缩器 |
+| `compress_domain_records(domain, records, **kwargs)` | 手动调用统一压缩入口 |
+
 ### 4.1 记忆相关
 
 | 方法 | 说明 |
@@ -141,6 +179,7 @@
 | `ingest_knowledge(title, text, **kwargs)` | `ingest_document` 别名 |
 | `get_document(document_id)` | 获取文档 |
 | `search_knowledge(query, **kwargs)` | 搜索知识库 |
+| `search_knowledge(query, include_global=True, **kwargs)` | 搜索知识库并兼容全局知识库 |
 
 ### 4.4 技能
 
@@ -160,6 +199,7 @@
 | `archive_session(session_id, **kwargs)` | 归档会话 |
 | `get_archive_unit(archive_unit_id)` | 获取归档单元 |
 | `search_archive(query, **kwargs)` | 搜索归档摘要 |
+| `search_archive(query, include_global=True, **kwargs)` | 搜索归档并兼容全局归档 |
 
 ### 4.6 执行过程
 
@@ -228,12 +268,13 @@
 
 | 工具名 | 说明 |
 | --- | --- |
+| `aimemory_manifest` | 返回能力、LiteLLM 配置与存储布局 |
 | `agent_context_query` | 跨域统一查询 |
-| `memory_store_long_term` | 写长期记忆 |
-| `memory_store_short_term` | 写短期记忆 |
-| `memory_search` | 搜索记忆 |
-| `knowledge_ingest` | 写知识文档 |
-| `skill_save` | 保存技能 |
+| `long_term_memory_*` | 长期记忆增删改查与压缩 |
+| `short_term_memory_*` | 短期记忆增删改查与压缩 |
+| `archive_memory_*` | 归档记忆增删改查与压缩 |
+| `knowledge_document_*` | 知识库文档增删改查 |
+| `skill_*` | 技能增删改查 |
 | `session_create` | 创建会话 |
 | `session_append_turn` | 追加对话轮次 |
 | `session_compress` | 压缩会话 |

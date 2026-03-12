@@ -307,18 +307,9 @@ class MemoryService(ServiceBase):
     def _resolve_memory_type(self, memory_type: str | None = None, text: str | None = None) -> str:
         if memory_type:
             return str(memory_type)
-        if text:
-            return self._infer_memory_type(text)
         return str(MemoryType.SEMANTIC)
 
     def _infer_memory_type(self, text: str) -> str:
-        lowered = text.lower()
-        if "prefer" in lowered or "喜欢" in text:
-            return str(MemoryType.PREFERENCE)
-        if "profile" in lowered or "身份" in text:
-            return str(MemoryType.PROFILE)
-        if "步骤" in text or "workflow" in lowered:
-            return str(MemoryType.PROCEDURAL)
         return str(MemoryType.SEMANTIC)
 
     def _extract_candidates(self, messages: list[NormalizedMessage]) -> list[str]:

@@ -53,6 +53,38 @@ memory = AIMemory(
 - 默认向量 / 图后端
 - 嵌入 runtime
 
+## 2.1 数据库插件接入
+
+关系型存储默认走本地 `SQLite`，也支持插件式注册：
+
+```python
+from aimemory import register_relational_backend
+from aimemory.storage.sqlite.database import SQLiteDatabase
+
+register_relational_backend("sqlite_alias", lambda config: SQLiteDatabase(config.sqlite_path))
+```
+
+然后在配置里选择：
+
+```python
+memory = AIMemory(
+    {
+        "root_dir": ".aimemory-demo",
+        "relational_backend": "sqlite_alias",
+    }
+)
+```
+
+## 2.2 域级 API 一览
+
+对外部 Agent 更推荐使用新的域级 API：
+
+- 长期记忆：`store_long_term_memory`、`list_long_term_memories`、`search_long_term_memories`
+- 短期记忆：`store_short_term_memory`、`list_short_term_memories`、`compress_short_term_memories`
+- 知识库：`save_knowledge_document`、`list_knowledge_documents`、`search_knowledge_documents`
+- 技能：`get_skill_content`、`list_skill_metadata`、`search_skill_keywords`
+- 归档：`save_archive_memory`、`list_archive_memories`、`compress_archive_memories`
+
 ## 3. 写入长期记忆
 
 ```python
@@ -183,6 +215,16 @@ result = memory.search_knowledge(
 - 建立知识索引
 - 写入对象存储
 
+### 8.1 写入全局知识库
+
+```python
+global_doc = memory.save_knowledge_document(
+    title="全局规则",
+    text="所有 agent 在资源不足时都应优先检索全局知识库。",
+    global_scope=True,
+)
+```
+
 ## 9. 写入技能
 
 ```python
@@ -225,6 +267,23 @@ print(archive["archive"])
 - 建立归档摘要索引
 - 为后续低成本唤起保留线索
 
+### 10.1 手动归档与归档压缩
+
+```python
+archive = memory.save_archive_memory(
+    summary="归档：当前用户偏好简洁、列表化、低 token 输出。",
+    owner_agent_id="agent.assistant",
+    subject_type="human",
+    subject_id="user-1",
+)
+
+compressed = memory.compress_archive_memories(
+    owner_agent_id="agent.assistant",
+    subject_type="human",
+    subject_id="user-1",
+)
+```
+
 ## 11. 面向团队多智能体平台的 scoped 用法
 
 如果同一 Agent 会频繁在某个固定作用域下工作，推荐先绑定 scoped 句柄：
@@ -260,6 +319,22 @@ print(result["results"])
 ```python
 layout = scoped.storage_layout()
 print(layout)
+```
+
+## 13.4 域级 MCP 工具
+
+```python
+adapter = scoped.create_mcp_adapter()
+
+print(adapter.litellm_config())
+print([tool["name"] for tool in adapter.tool_specs()[:8]])
+
+result = adapter.call_tool(
+    "long_term_memory_list",
+    {
+        "limit": 10,
+    },
+)
 ```
 
 这个接口适合：

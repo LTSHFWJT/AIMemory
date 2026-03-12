@@ -21,6 +21,12 @@ class MemoryPolicy:
     compression_turn_threshold: int = 18
     compression_preserve_recent_turns: int = 8
     compression_budget_chars: int = 640
+    long_term_char_threshold: int = 12000
+    long_term_compression_budget_chars: int = 1600
+    short_term_char_threshold: int = 6000
+    short_term_compression_budget_chars: int = 900
+    archive_char_threshold: int = 18000
+    archive_compression_budget_chars: int = 1800
     cleanup_importance_threshold: float = 0.26
     cleanup_staleness_days: int = 30
     snapshot_keep_recent: int = 3

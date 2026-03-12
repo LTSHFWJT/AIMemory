@@ -1,0 +1,195 @@
+from __future__ import annotations
+
+import unittest
+from tempfile import TemporaryDirectory
+
+from aimemory import AIMemory, register_relational_backend
+from aimemory.storage.sqlite.database import SQLiteDatabase
+
+
+class AgentDomainAPITest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = TemporaryDirectory()
+        self.memory = AIMemory(
+            {
+                "root_dir": self.tempdir.name,
+                "memory_policy": {
+                    "long_term_char_threshold": 40,
+                    "long_term_compression_budget_chars": 60,
+                    "short_term_char_threshold": 20,
+                    "short_term_compression_budget_chars": 50,
+                    "archive_char_threshold": 20,
+                    "archive_compression_budget_chars": 60,
+                    "compression_turn_threshold": 1,
+                    "compression_preserve_recent_turns": 0,
+                },
+            }
+        )
+
+    def tearDown(self) -> None:
+        self.memory.close()
+        self.tempdir.cleanup()
+
+    def test_domain_crud_and_scope_isolation(self) -> None:
+        human = self.memory.store_long_term_memory(
+            "用户偏好简洁分点回答，并且希望所有输出都尽量先给结论。",
+            owner_agent_id="agent.alpha",
+            subject_type="human",
+            subject_id="user-1",
+        )
+        agent = self.memory.store_long_term_memory(
+            "agent.beta 在协作时偏好先拿完整上下文，再做执行。",
+            owner_agent_id="agent.alpha",
+            subject_type="agent",
+            subject_id="agent.beta",
+        )
+        self.assertTrue(human["id"])
+        self.assertTrue(agent["id"])
+
+        human_list = self.memory.list_long_term_memories(
+            owner_agent_id="agent.alpha",
+            subject_type="human",
+            subject_id="user-1",
+        )
+        agent_list = self.memory.list_long_term_memories(
+            owner_agent_id="agent.alpha",
+            subject_type="agent",
+            subject_id="agent.beta",
+        )
+        self.assertEqual(human_list["count"], 1)
+        self.assertEqual(agent_list["count"], 1)
+        self.assertEqual(human_list["results"][0]["id"], human["id"])
+        self.assertEqual(agent_list["results"][0]["id"], agent["id"])
+
+        updated = self.memory.update_long_term_memory(human["id"], text="用户偏好先给结论，再给分点说明。")
+        self.assertEqual(updated["id"], human["id"])
+        self.assertTrue(
+            self.memory.search_long_term_memories(
+                "先给结论",
+                owner_agent_id="agent.alpha",
+                subject_type="human",
+                subject_id="user-1",
+            )["results"]
+        )
+
+        session = self.memory.create_session(
+            owner_agent_id="agent.alpha",
+            subject_type="human",
+            subject_id="user-1",
+            title="demo",
+        )
+        short_term = self.memory.store_short_term_memory(
+            "这轮会话需要完成架构评审，并且要保留插件化与轻量化约束。",
+            owner_agent_id="agent.alpha",
+            subject_type="human",
+            subject_id="user-1",
+            session_id=session["id"],
+        )
+        self.assertTrue(short_term["id"])
+        compressed = self.memory.compress_short_term_memories(
+            owner_agent_id="agent.alpha",
+            subject_type="human",
+            subject_id="user-1",
+            session_id=session["id"],
+        )
+        self.assertTrue(compressed["triggered"])
+        self.assertTrue(compressed["snapshot"]["id"])
+
+        deleted = self.memory.delete_long_term_memory(agent["id"])
+        self.assertEqual(deleted["status"], "deleted")
+
+    def test_global_knowledge_archive_skill_and_mcp(self) -> None:
+        document = self.memory.save_knowledge_document(
+            title="平台接入规范",
+            text="AIMemory 面向多主体、多智能体协同平台，提供本地优先记忆存储。",
+            owner_agent_id="agent.alpha",
+            subject_type="human",
+            subject_id="user-1",
+        )
+        global_document = self.memory.save_knowledge_document(
+            title="全局知识",
+            text="所有 agent 都可以访问全局知识库中的这条规则。",
+            global_scope=True,
+        )
+        self.assertTrue(document["id"])
+        self.assertTrue(global_document["id"])
+
+        listed_docs = self.memory.list_knowledge_documents(
+            owner_agent_id="agent.alpha",
+            subject_type="human",
+            subject_id="user-1",
+        )
+        self.assertGreaterEqual(len(listed_docs["results"]), 2)
+        self.assertTrue(
+            self.memory.search_knowledge_documents(
+                "全局知识",
+                owner_agent_id="agent.alpha",
+                subject_type="human",
+                subject_id="user-1",
+            )["results"]
+        )
+
+        skill = self.memory.save_skill(
+            name="context_compactor",
+            description="压缩长上下文并保留关键步骤。",
+            owner_agent_id="agent.alpha",
+            subject_type="agent",
+            subject_id="agent.beta",
+            tools=["search"],
+            topics=["compression"],
+        )
+        skill_metadata = self.memory.list_skill_metadata(owner_agent_id="agent.alpha")
+        self.assertEqual(skill_metadata["results"][0]["id"], skill["id"])
+
+        updated_skill = self.memory.update_skill(
+            skill["id"],
+            description="压缩长上下文、提取关键步骤并降低 token 成本。",
+            tools=["search", "summarize"],
+        )
+        self.assertEqual(updated_skill["id"], skill["id"])
+        self.assertGreaterEqual(len(updated_skill["versions"]), 2)
+
+        archive = self.memory.save_archive_memory(
+            summary="归档：平台需要本地优先、多层记忆、插件化数据库能力。",
+            owner_agent_id="agent.alpha",
+            subject_type="human",
+            subject_id="user-1",
+        )
+        self.assertTrue(archive["id"])
+        self.assertTrue(
+            self.memory.search_archive_memories(
+                "插件化数据库",
+                owner_agent_id="agent.alpha",
+                subject_type="human",
+                subject_id="user-1",
+            )["results"]
+        )
+        self.assertTrue(
+            self.memory.compress_archive_memories(
+                owner_agent_id="agent.alpha",
+                subject_type="human",
+                subject_id="user-1",
+            )["triggered"]
+        )
+
+        adapter = self.memory.create_mcp_adapter(
+            scope={"owner_agent_id": "agent.alpha", "subject_type": "human", "subject_id": "user-1"}
+        )
+        manifest = adapter.call_tool("aimemory_manifest", {})
+        self.assertEqual(manifest["storage"]["relational_backend"], "sqlite")
+        mcp_list = adapter.call_tool("long_term_memory_list", {"limit": 10})
+        self.assertTrue(isinstance(mcp_list["results"], list))
+
+        deleted = self.memory.delete_skill(skill["id"])
+        self.assertTrue(deleted["deleted"])
+
+    def test_relational_backend_plugin_registration(self) -> None:
+        register_relational_backend("sqlite_alias", lambda config: SQLiteDatabase(config.sqlite_path))
+        with TemporaryDirectory() as tmp:
+            memory = AIMemory({"root_dir": tmp, "relational_backend": "sqlite_alias"})
+            self.assertEqual(memory.storage_layout()["relational_backend"], "sqlite_alias")
+            memory.close()
+
+
+if __name__ == "__main__":
+    unittest.main()

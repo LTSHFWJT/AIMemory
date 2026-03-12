@@ -65,6 +65,7 @@ class AIMemoryConfig:
     root_dir: str | Path = ".aimemory"
     sqlite_path: str | Path | None = None
     object_store_path: str | Path | None = None
+    relational_backend: str = "sqlite"
     default_user_id: str = "default"
     platform_id: str | None = None
     workspace_id: str | None = None
