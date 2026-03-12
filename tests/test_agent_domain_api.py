@@ -31,13 +31,13 @@ class AgentDomainAPITest(unittest.TestCase):
         self.tempdir.cleanup()
 
     def test_domain_crud_and_scope_isolation(self) -> None:
-        human = self.memory.store_long_term_memory(
+        human = self.memory.api.long_term.add(
             "用户偏好简洁分点回答，并且希望所有输出都尽量先给结论。",
             owner_agent_id="agent.alpha",
             subject_type="human",
             subject_id="user-1",
         )
-        agent = self.memory.store_long_term_memory(
+        agent = self.memory.api.long_term.add(
             "agent.beta 在协作时偏好先拿完整上下文，再做执行。",
             owner_agent_id="agent.alpha",
             subject_type="agent",
@@ -46,12 +46,12 @@ class AgentDomainAPITest(unittest.TestCase):
         self.assertTrue(human["id"])
         self.assertTrue(agent["id"])
 
-        human_list = self.memory.list_long_term_memories(
+        human_list = self.memory.api.long_term.list(
             owner_agent_id="agent.alpha",
             subject_type="human",
             subject_id="user-1",
         )
-        agent_list = self.memory.list_long_term_memories(
+        agent_list = self.memory.api.long_term.list(
             owner_agent_id="agent.alpha",
             subject_type="agent",
             subject_id="agent.beta",
@@ -61,10 +61,10 @@ class AgentDomainAPITest(unittest.TestCase):
         self.assertEqual(human_list["results"][0]["id"], human["id"])
         self.assertEqual(agent_list["results"][0]["id"], agent["id"])
 
-        updated = self.memory.update_long_term_memory(human["id"], text="用户偏好先给结论，再给分点说明。")
+        updated = self.memory.api.long_term.update(human["id"], text="用户偏好先给结论，再给分点说明。")
         self.assertEqual(updated["id"], human["id"])
         self.assertTrue(
-            self.memory.search_long_term_memories(
+            self.memory.api.long_term.search(
                 "先给结论",
                 owner_agent_id="agent.alpha",
                 subject_type="human",
@@ -72,13 +72,13 @@ class AgentDomainAPITest(unittest.TestCase):
             )["results"]
         )
 
-        session = self.memory.create_session(
+        session = self.memory.api.session.create(
             owner_agent_id="agent.alpha",
             subject_type="human",
             subject_id="user-1",
             title="demo",
         )
-        short_term = self.memory.store_short_term_memory(
+        short_term = self.memory.api.short_term.add(
             "这轮会话需要完成架构评审，并且要保留插件化与轻量化约束。",
             owner_agent_id="agent.alpha",
             subject_type="human",
@@ -86,7 +86,7 @@ class AgentDomainAPITest(unittest.TestCase):
             session_id=session["id"],
         )
         self.assertTrue(short_term["id"])
-        compressed = self.memory.compress_short_term_memories(
+        compressed = self.memory.api.short_term.compress(
             owner_agent_id="agent.alpha",
             subject_type="human",
             subject_id="user-1",
@@ -95,18 +95,18 @@ class AgentDomainAPITest(unittest.TestCase):
         self.assertTrue(compressed["triggered"])
         self.assertTrue(compressed["snapshot"]["id"])
 
-        deleted = self.memory.delete_long_term_memory(agent["id"])
+        deleted = self.memory.api.long_term.delete(agent["id"])
         self.assertEqual(deleted["status"], "deleted")
 
     def test_global_knowledge_archive_skill_and_mcp(self) -> None:
-        document = self.memory.save_knowledge_document(
+        document = self.memory.api.knowledge.add(
             title="平台接入规范",
             text="AIMemory 面向多主体、多智能体协同平台，提供本地优先记忆存储。",
             owner_agent_id="agent.alpha",
             subject_type="human",
             subject_id="user-1",
         )
-        global_document = self.memory.save_knowledge_document(
+        global_document = self.memory.api.knowledge.add(
             title="全局知识",
             text="所有 agent 都可以访问全局知识库中的这条规则。",
             global_scope=True,
@@ -114,14 +114,14 @@ class AgentDomainAPITest(unittest.TestCase):
         self.assertTrue(document["id"])
         self.assertTrue(global_document["id"])
 
-        listed_docs = self.memory.list_knowledge_documents(
+        listed_docs = self.memory.api.knowledge.list(
             owner_agent_id="agent.alpha",
             subject_type="human",
             subject_id="user-1",
         )
         self.assertGreaterEqual(len(listed_docs["results"]), 2)
         self.assertTrue(
-            self.memory.search_knowledge_documents(
+            self.memory.api.knowledge.search(
                 "全局知识",
                 owner_agent_id="agent.alpha",
                 subject_type="human",
@@ -129,7 +129,7 @@ class AgentDomainAPITest(unittest.TestCase):
             )["results"]
         )
 
-        skill = self.memory.save_skill(
+        skill = self.memory.api.skill.add(
             name="context_compactor",
             description="压缩长上下文并保留关键步骤。",
             owner_agent_id="agent.alpha",
@@ -138,10 +138,10 @@ class AgentDomainAPITest(unittest.TestCase):
             tools=["search"],
             topics=["compression"],
         )
-        skill_metadata = self.memory.list_skill_metadata(owner_agent_id="agent.alpha")
+        skill_metadata = self.memory.api.skill.list(owner_agent_id="agent.alpha")
         self.assertEqual(skill_metadata["results"][0]["id"], skill["id"])
 
-        updated_skill = self.memory.update_skill(
+        updated_skill = self.memory.api.skill.update(
             skill["id"],
             description="压缩长上下文、提取关键步骤并降低 token 成本。",
             tools=["search", "summarize"],
@@ -149,7 +149,7 @@ class AgentDomainAPITest(unittest.TestCase):
         self.assertEqual(updated_skill["id"], skill["id"])
         self.assertGreaterEqual(len(updated_skill["versions"]), 2)
 
-        archive = self.memory.save_archive_memory(
+        archive = self.memory.api.archive.add(
             summary="归档：平台需要本地优先、多层记忆、插件化数据库能力。",
             owner_agent_id="agent.alpha",
             subject_type="human",
@@ -157,7 +157,7 @@ class AgentDomainAPITest(unittest.TestCase):
         )
         self.assertTrue(archive["id"])
         self.assertTrue(
-            self.memory.search_archive_memories(
+            self.memory.api.archive.search(
                 "插件化数据库",
                 owner_agent_id="agent.alpha",
                 subject_type="human",
@@ -165,7 +165,7 @@ class AgentDomainAPITest(unittest.TestCase):
             )["results"]
         )
         self.assertTrue(
-            self.memory.compress_archive_memories(
+            self.memory.api.archive.compress(
                 owner_agent_id="agent.alpha",
                 subject_type="human",
                 subject_id="user-1",
@@ -180,7 +180,7 @@ class AgentDomainAPITest(unittest.TestCase):
         mcp_list = adapter.call_tool("long_term_memory_list", {"limit": 10})
         self.assertTrue(isinstance(mcp_list["results"], list))
 
-        deleted = self.memory.delete_skill(skill["id"])
+        deleted = self.memory.api.skill.delete(skill["id"])
         self.assertTrue(deleted["deleted"])
 
     def test_relational_backend_plugin_registration(self) -> None:

@@ -180,13 +180,21 @@ pip install .[all]
 
 ### 0. 面向 Agent 的域级 API
 
-除原有 `remember_* / ingest_* / save_skill / archive_*` 入口外，`AIMemory` 现在直接提供更适合外部 Agent 调用的域级 API：
+除原有 `remember_* / ingest_* / save_skill / archive_*` 入口外，`AIMemory` 现在直接提供更适合外部 Agent 调用的域级 API。
 
-- 长期记忆：`store_long_term_memory`、`get_long_term_memory`、`list_long_term_memories`、`search_long_term_memories`、`update_long_term_memory`、`delete_long_term_memory`、`compress_long_term_memories`
-- 短期记忆：`store_short_term_memory`、`get_short_term_memory`、`list_short_term_memories`、`search_short_term_memories`、`update_short_term_memory`、`delete_short_term_memory`、`compress_short_term_memories`
-- 归档记忆：`save_archive_memory`、`get_archive_memory`、`list_archive_memories`、`search_archive_memories`、`update_archive_memory`、`delete_archive_memory`、`compress_archive_memories`
-- 技能：`save_skill`、`get_skill_content`、`list_skill_metadata`、`search_skill_keywords`、`update_skill`、`delete_skill`
-- 知识库：`save_knowledge_document`、`get_knowledge_document`、`list_knowledge_documents`、`search_knowledge_documents`、`update_knowledge_document`、`delete_knowledge_document`
+推荐优先使用新的分组入口：
+
+- `memory.api.long_term.add/get/list/search/update/delete/compress`
+- `memory.api.short_term.add/get/list/search/update/delete/compress`
+- `memory.api.knowledge.add/get/list/search/update/delete`
+- `memory.api.skill.add/get/list/search/update/delete`
+- `memory.api.archive.add/get/list/search/update/delete/compress`
+- `memory.api.session.create/get/append/compress/promote/archive/govern`
+- `memory.api.recall.query/explain`
+
+`ScopedAIMemory` 同样支持 `scoped.api.*`。
+
+旧的平铺方法不再作为对外接口，统一使用 `memory.api.*` / `scoped.api.*`。
 
 这些接口会自动沿用：
 
@@ -228,7 +236,7 @@ memory = AIMemory(
 知识库与归档支持 `global_scope=True`，用于所有 agent 可访问的共享内容：
 
 ```python
-memory.save_knowledge_document(
+memory.api.knowledge.add(
     title="全局规则",
     text="所有 agent 都必须优先检索本地知识库，再决定是否访问外部模型。",
     global_scope=True,
@@ -251,7 +259,7 @@ memory.register_domain_compressor("long_term", custom_compressor)
 from aimemory import AIMemory
 
 with AIMemory({"root_dir": ".aimemory-demo"}) as memory:
-    session = memory.create_session(
+    session = memory.api.session.create(
         user_id="user-1",
         owner_agent_id="agent.assistant",
         subject_type="human",
@@ -260,13 +268,13 @@ with AIMemory({"root_dir": ".aimemory-demo"}) as memory:
         title="demo",
     )
 
-    memory.append_turn(
+    memory.api.session.append(
         session["id"],
         "user",
         "我偏好 Markdown 列表输出，并且希望尽量节省 token。",
     )
 
-    memory.remember_long_term(
+    memory.api.long_term.add(
         "用户偏好 Markdown 列表输出。",
         user_id="user-1",
         owner_agent_id="agent.assistant",
@@ -277,7 +285,7 @@ with AIMemory({"root_dir": ".aimemory-demo"}) as memory:
         importance=0.9,
     )
 
-    memory.ingest_document(
+    memory.api.knowledge.add(
         "上下文压缩策略",
         "AIMemory 使用本地算法对会话做压缩与归档。",
         user_id="user-1",
@@ -286,7 +294,7 @@ with AIMemory({"root_dir": ".aimemory-demo"}) as memory:
         subject_id="user-1",
     )
 
-    result = memory.query(
+    result = memory.api.recall.query(
         "用户偏好什么输出形式，以及如何压缩上下文",
         user_id="user-1",
         owner_agent_id="agent.assistant",
@@ -323,11 +331,11 @@ planner_memory = memory.scoped(
     project_id="mission-42",
 )
 
-session = planner_memory.create_session(title="planner-executor sync")
-planner_memory.append_turn(session["id"], "assistant", "把最近执行经验压缩成短摘要。")
-planner_memory.remember_long_term("executor 擅长把长计划压缩成可执行步骤。")
+session = planner_memory.api.session.create(title="planner-executor sync")
+planner_memory.api.session.append(session["id"], "assistant", "把最近执行经验压缩成短摘要。")
+planner_memory.api.long_term.add("executor 擅长把长计划压缩成可执行步骤。")
 
-print(planner_memory.query("executor 最近擅长什么", domains=["memory", "skill"]))
+print(planner_memory.api.recall.query("executor 最近擅长什么", domains=["memory", "skill"]))
 ```
 
 ### 3. 查看当前作用域下的存储布局
@@ -355,7 +363,7 @@ adapter = memory.create_mcp_adapter(
 tools = adapter.tool_specs()
 
 result = adapter.call_tool(
-    "agent_context_query",
+    "recall_query",
     {
         "query": "最近的执行偏好",
         "context_scope": {
@@ -401,7 +409,7 @@ register_graph_backend("my_graph", my_graph_factory)
 
 - 希望快速集成
 - 希望统一使用一个 Facade
-- 希望直接走 `query()` / `remember_*()` / `ingest_document()` / `archive_session()`
+- 希望直接走 `memory.api.*` 的统一分组接口
 
 ### 适合用 `ScopedAIMemory`
 

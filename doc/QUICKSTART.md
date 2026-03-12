@@ -77,18 +77,24 @@ memory = AIMemory(
 
 ## 2.2 域级 API 一览
 
-对外部 Agent 更推荐使用新的域级 API：
+对外部 Agent 更推荐使用新的分组入口 `memory.api.*`：
 
-- 长期记忆：`store_long_term_memory`、`list_long_term_memories`、`search_long_term_memories`
-- 短期记忆：`store_short_term_memory`、`list_short_term_memories`、`compress_short_term_memories`
-- 知识库：`save_knowledge_document`、`list_knowledge_documents`、`search_knowledge_documents`
-- 技能：`get_skill_content`、`list_skill_metadata`、`search_skill_keywords`
-- 归档：`save_archive_memory`、`list_archive_memories`、`compress_archive_memories`
+- `memory.api.long_term.add/get/list/search/update/delete/compress`
+- `memory.api.short_term.add/get/list/search/update/delete/compress`
+- `memory.api.knowledge.add/get/list/search/update/delete`
+- `memory.api.skill.add/get/list/search/update/delete`
+- `memory.api.archive.add/get/list/search/update/delete/compress`
+- `memory.api.session.create/get/append/compress/promote/archive/govern`
+- `memory.api.recall.query/explain`
+
+`ScopedAIMemory` 对应使用 `scoped.api.*`。
+
+旧的平铺方法不再作为对外接口，统一使用 `memory.api.*` / `scoped.api.*`。
 
 ## 3. 写入长期记忆
 
 ```python
-memory.remember_long_term(
+memory.api.long_term.add(
     "用户偏好 Markdown 列表输出。",
     user_id="user-1",
     owner_agent_id="agent.assistant",
@@ -110,7 +116,7 @@ memory.remember_long_term(
 ## 4. 创建会话并写入短期上下文
 
 ```python
-session = memory.create_session(
+session = memory.api.session.create(
     user_id="user-1",
     owner_agent_id="agent.assistant",
     subject_type="human",
@@ -119,7 +125,7 @@ session = memory.create_session(
     title="demo",
 )
 
-memory.append_turn(
+memory.api.session.append(
     session["id"],
     "user",
     "请记住我喜欢简洁、分点的回答方式。",
@@ -136,7 +142,7 @@ memory.append_turn(
 ## 5. 做统一查询
 
 ```python
-result = memory.query(
+result = memory.api.recall.query(
     "用户喜欢什么输出风格？",
     user_id="user-1",
     owner_agent_id="agent.assistant",
@@ -151,7 +157,7 @@ result = memory.query(
 print(result["results"])
 ```
 
-`query()` 会跨域聚合：
+`memory.api.recall.query()` 会跨域聚合：
 
 - 记忆
 - 交互上下文
@@ -165,7 +171,7 @@ print(result["results"])
 ## 6. 压缩会话上下文
 
 ```python
-compressed = memory.compress_session_context(session["id"], budget_chars=600)
+compressed = memory.api.session.compress(session["id"], budget_chars=600)
 print(compressed["snapshot"])
 ```
 
@@ -178,7 +184,7 @@ print(compressed["snapshot"])
 ## 7. 晋升短期记忆到长期记忆
 
 ```python
-promoted = memory.promote_session_memories(session["id"])
+promoted = memory.api.session.promote(session["id"])
 print(promoted["results"])
 ```
 
@@ -191,7 +197,7 @@ print(promoted["results"])
 ## 8. 写入知识库
 
 ```python
-document = memory.ingest_document(
+document = memory.api.knowledge.add(
     "上下文压缩策略",
     "AIMemory 使用本地算法对会话做压缩、去重和检索。",
     owner_agent_id="agent.assistant",
@@ -200,7 +206,7 @@ document = memory.ingest_document(
     source_name="demo-doc",
 )
 
-result = memory.search_knowledge(
+result = memory.api.knowledge.search(
     "压缩策略",
     owner_agent_id="agent.assistant",
     subject_type="human",
@@ -218,7 +224,7 @@ result = memory.search_knowledge(
 ### 8.1 写入全局知识库
 
 ```python
-global_doc = memory.save_knowledge_document(
+global_doc = memory.api.knowledge.add(
     title="全局规则",
     text="所有 agent 在资源不足时都应优先检索全局知识库。",
     global_scope=True,
@@ -228,7 +234,7 @@ global_doc = memory.save_knowledge_document(
 ## 9. 写入技能
 
 ```python
-skill = memory.save_skill(
+skill = memory.api.skill.add(
     "context_compactor",
     "把长上下文压缩成简洁步骤。",
     owner_agent_id="agent.assistant",
@@ -238,7 +244,7 @@ skill = memory.save_skill(
     topics=["compression", "memory"],
 )
 
-result = memory.search_skills(
+result = memory.api.skill.search(
     "压缩长上下文",
     owner_agent_id="agent.assistant",
     subject_type="agent",
@@ -256,7 +262,7 @@ result = memory.search_skills(
 ## 10. 做归档
 
 ```python
-archive = memory.archive_session(session["id"])
+archive = memory.api.session.archive(session["id"])
 print(archive["archive"])
 ```
 
@@ -270,14 +276,14 @@ print(archive["archive"])
 ### 10.1 手动归档与归档压缩
 
 ```python
-archive = memory.save_archive_memory(
+archive = memory.api.archive.add(
     summary="归档：当前用户偏好简洁、列表化、低 token 输出。",
     owner_agent_id="agent.assistant",
     subject_type="human",
     subject_id="user-1",
 )
 
-compressed = memory.compress_archive_memories(
+compressed = memory.api.archive.compress(
     owner_agent_id="agent.assistant",
     subject_type="human",
     subject_id="user-1",
@@ -299,11 +305,11 @@ scoped = memory.scoped(
     project_id="mission-42",
 )
 
-session = scoped.create_session(title="planner-executor sync")
-scoped.append_turn(session["id"], "assistant", "总结最近执行偏差。")
-scoped.remember_long_term("executor 擅长从长计划提炼执行步骤。")
+session = scoped.api.session.create(title="planner-executor sync")
+scoped.api.session.append(session["id"], "assistant", "总结最近执行偏差。")
+scoped.api.long_term.add("executor 擅长从长计划提炼执行步骤。")
 
-result = scoped.query("executor 擅长什么")
+result = scoped.api.recall.query("executor 擅长什么")
 print(result["results"])
 ```
 
@@ -364,7 +370,7 @@ print([tool["name"] for tool in tools])
 
 ```python
 result = adapter.call_tool(
-    "agent_context_query",
+    "recall_query",
     {
         "query": "最近的执行偏好",
         "context_scope": {
@@ -388,9 +394,9 @@ server = adapter.bind_fastmcp()
 
 1. 先接 `AIMemoryConfig`
 2. 再接 `memory.scoped(...)`
-3. 用 `remember_*()` / `append_turn()` / `ingest_document()` / `save_skill()`
-4. 用 `query()` 做统一召回
-5. 视场景加上 `archive_session()` / `compress_session_context()`
+3. 用 `memory.api.long_term` / `memory.api.session` / `memory.api.knowledge` / `memory.api.skill`
+4. 用 `memory.api.recall.query()` 做统一召回
+5. 视场景加上 `memory.api.session.archive()` / `memory.api.session.compress()`
 6. 最后再接 `create_mcp_adapter()`
 
 ## 15. 常见建议

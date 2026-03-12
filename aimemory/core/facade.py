@@ -93,6 +93,7 @@ class AIMemory:
         self.distiller = AdaptiveDistiller(self.config.memory_policy)
         self._domain_compressors: dict[str, Callable[..., Any]] = {}
         self._agent_store_api = None
+        self._structured_api = None
         self._closed = False
 
     def _ensure_runtime_schema(self) -> None:
@@ -2164,13 +2165,27 @@ class AIMemory:
 
         return AIMemoryMCPAdapter(self, scope=scope)
 
-    @property
-    def agent_store(self):
+    def _domain_api(self):
         if self._agent_store_api is None:
             from aimemory.core.domain_api import AgentStoreAPI
 
             self._agent_store_api = AgentStoreAPI(self)
         return self._agent_store_api
+
+    def _call_api_method(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        try:
+            target = object.__getattribute__(self, method_name)
+        except AttributeError:
+            target = getattr(self._domain_api(), method_name)
+        return target(*args, **kwargs)
+
+    @property
+    def api(self):
+        if self._structured_api is None:
+            from aimemory.core.structured_api import StructuredAIMemoryAPI
+
+            self._structured_api = StructuredAIMemoryAPI(self)
+        return self._structured_api
 
     def litellm_config(self) -> dict[str, Any]:
         return self.config.providers.as_litellm_kwargs()
@@ -2252,13 +2267,10 @@ class AIMemory:
             "provider": provider,
         }
 
-    def __getattr__(self, name: str):
-        if name.startswith("_"):
-            raise AttributeError(name)
-        agent_store = self.agent_store
-        if hasattr(agent_store, name):
-            return getattr(agent_store, name)
-        raise AttributeError(name)
+    def __dir__(self):
+        names = set(super().__dir__())
+        names.update({"api"})
+        return sorted(names)
 
     def close(self) -> None:
         if self._closed:
@@ -3333,6 +3345,15 @@ class AIMemory:
 class AsyncAIMemory:
     def __init__(self, config: AIMemoryConfig | dict[str, Any] | None = None):
         self._sync = AIMemory(config)
+        self._structured_api = None
+
+    @property
+    def api(self):
+        if self._structured_api is None:
+            from aimemory.core.structured_api import AsyncStructuredAIMemoryAPI
+
+            self._structured_api = AsyncStructuredAIMemoryAPI(self._sync)
+        return self._structured_api
 
     def __getattr__(self, name: str):
         target = getattr(self._sync, name)
@@ -3346,3 +3367,8 @@ class AsyncAIMemory:
 
     async def close(self) -> None:
         await asyncio.to_thread(self._sync.close)
+
+    def __dir__(self):
+        names = set(super().__dir__())
+        names.update({"api"})
+        return sorted(names)

@@ -20,11 +20,11 @@ class ScopedMemoryTests(unittest.TestCase):
                 workspace_one = memory.scoped(workspace_id="ws.one", **scope_common)
                 workspace_two = memory.scoped(workspace_id="ws.two", **scope_common)
 
-                workspace_one.remember_long_term("workspace one secret execution pattern")
-                workspace_two.remember_long_term("workspace two secret execution pattern")
+                workspace_one.api.long_term.add("workspace one secret execution pattern")
+                workspace_two.api.long_term.add("workspace two secret execution pattern")
 
-                result_one = workspace_one.query("secret execution pattern", domains=["memory"], limit=10)
-                result_two = workspace_two.query("secret execution pattern", domains=["memory"], limit=10)
+                result_one = workspace_one.api.recall.query("secret execution pattern", domains=["memory"], limit=10)
+                result_two = workspace_two.api.recall.query("secret execution pattern", domains=["memory"], limit=10)
 
                 texts_one = [item.get("text", "") for item in result_one["results"]]
                 texts_two = [item.get("text", "") for item in result_two["results"]]
@@ -44,8 +44,8 @@ class ScopedMemoryTests(unittest.TestCase):
                     interaction_type="human_agent",
                     project_id="project-x",
                 )
-                session = scoped.create_session(user_id="user-1", title="demo")
-                turn = scoped.append_turn(session["id"], "user", "我喜欢用简洁 bullet 输出。")
+                session = scoped.api.session.create(user_id="user-1", title="demo")
+                turn = scoped.api.session.append(session["id"], "user", "我喜欢用简洁 bullet 输出。")
                 layout = scoped.storage_layout()
 
                 self.assertIsNotNone(session.get("namespace_key"))
@@ -79,7 +79,7 @@ class ScopedMemoryTests(unittest.TestCase):
                     },
                 )
                 adapter.call_tool(
-                    "memory_store_long_term",
+                    "long_term_memory_add",
                     {
                         "text": "user-1 prefers concise markdown bullets",
                         "session_id": session["id"],
@@ -93,7 +93,7 @@ class ScopedMemoryTests(unittest.TestCase):
                 )
 
                 result = adapter.call_tool(
-                    "agent_context_query",
+                    "recall_query",
                     {
                         "query": "concise markdown bullets",
                         "domains": ["memory"],

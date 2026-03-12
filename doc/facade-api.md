@@ -4,6 +4,23 @@
 
 如果你只想接一个 API 层，优先看这份文档。
 
+## 1.1 推荐的收敛调用方式
+
+当前推荐优先使用分组入口：
+
+- `memory.api.long_term.*`
+- `memory.api.short_term.*`
+- `memory.api.knowledge.*`
+- `memory.api.skill.*`
+- `memory.api.archive.*`
+- `memory.api.session.*`
+- `memory.api.recall.*`
+
+其中 `ScopedAIMemory` 对应 `scoped.api.*`。
+
+详细参数、返回结构与调用示例请直接看 `doc/API_REFERENCE.md`。
+本文件以下内容更适合作为底层实现说明，不再代表推荐对外接口面。
+
 ## 1. 什么时候用 Facade
 
 推荐直接使用 Facade 的场景：

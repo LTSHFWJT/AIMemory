@@ -190,7 +190,7 @@ Service / Worker 更适合：
 
 ### 使用建议
 
-- 平台业务层优先用 `AIMemory.query()`
+- 平台业务层优先用 `AIMemory.api.recall.query()`
 - 如果你在做自定义检索编排，再下沉到 `RetrievalService`
 
 ## 9. `ProjectionService`
