@@ -1,0 +1,26 @@
+name: Sync aimemory to AITeams
+
+on:
+  push:
+    branches: ["main"]   # 监听 main 分支 push，按需改成 master
+  workflow_dispatch:     # 保留手动触发
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source repo
+        uses: actions/checkout@v4
+
+      - name: Push aimemory folder to AITeams repo
+        uses: cpina/github-action-push-to-another-repository@main
+        env:
+          API_TOKEN_GITHUB: ${{ secrets.SYNC_TOKEN }}
+        with:
+          source-directory: 'aimemory'           # 源仓库中的文件夹
+          destination-github-username: 'LTSHFWJT'
+          destination-repository-name: 'AITeams'
+          target-branch: main
+          target-directory: 'aimemory'           # 目标仓库里的目录
+          user-email: '1719636402@qq.com'   # 随便填一个你的邮箱
