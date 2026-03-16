@@ -101,6 +101,103 @@ class StructuredAPITest(unittest.TestCase):
         self.assertEqual(short_term["owner_agent_id"], "agent.planner")
         self.assertEqual(search["results"][0]["id"], short_term["id"])
 
+    def test_skill_package_files_are_persisted_and_reference_text_is_searchable(self) -> None:
+        skill = self.memory.api.skill.add(
+            "doc_writer",
+            "生成和维护技术文档。",
+            owner_agent_id="agent.alpha",
+            subject_type="agent",
+            subject_id="agent.alpha",
+            prompt_template="先整理大纲，再输出正文。",
+            references={
+                "references/style-guide.md": "标题遵循 RFC 风格，示例必须给出输入输出。",
+            },
+            scripts={
+                "scripts/render.py": "print('render docs')\n",
+            },
+            assets={
+                "assets/template.txt": "## Template\n\n- Summary\n",
+            },
+        )
+
+        loaded = self.memory.api.skill.get(skill["id"])
+        latest = loaded["versions"][0]
+        file_paths = {item["relative_path"] for item in latest["files"]}
+        self.assertIn("SKILL.md", file_paths)
+        self.assertIn("references/style-guide.md", file_paths)
+        self.assertIn("scripts/render.py", file_paths)
+        self.assertIn("assets/template.txt", file_paths)
+        self.assertTrue(latest["skill_markdown"].startswith("---"))
+        self.assertEqual(
+            next(item["content"] for item in latest["references"] if item["relative_path"] == "references/style-guide.md"),
+            "标题遵循 RFC 风格，示例必须给出输入输出。",
+        )
+
+        search = self.memory.api.skill.search(
+            "RFC 风格 示例 输入输出",
+            owner_agent_id="agent.alpha",
+            subject_type="agent",
+            subject_id="agent.alpha",
+        )
+        self.assertTrue(search["results"])
+        self.assertEqual(search["results"][0]["skill_id"], skill["id"])
+
+        reference_search = self.memory.api.skill.search_references(
+            "RFC 风格 示例 输入输出",
+            owner_agent_id="agent.alpha",
+            subject_type="agent",
+            subject_id="agent.alpha",
+            skill_id=skill["id"],
+        )
+        self.assertTrue(reference_search["results"])
+        self.assertEqual(reference_search["results"][0]["skill_id"], skill["id"])
+        self.assertEqual(reference_search["results"][0]["relative_path"], "references/style-guide.md")
+
+        self.assertGreaterEqual(
+            self.memory.db.fetch_one("SELECT COUNT(*) AS count FROM skill_files WHERE skill_id = ?", (skill["id"],))["count"],
+            4,
+        )
+        self.assertGreaterEqual(
+            self.memory.db.fetch_one(
+                "SELECT COUNT(*) AS count FROM skill_reference_index WHERE skill_id = ?",
+                (skill["id"],),
+            )["count"],
+            1,
+        )
+
+    def test_skill_update_preserves_existing_package_files(self) -> None:
+        skill = self.memory.api.skill.add(
+            "release_helper",
+            "管理发布说明。",
+            owner_agent_id="agent.alpha",
+            subject_type="agent",
+            subject_id="agent.alpha",
+            references={"references/base.md": "保留 changelog 历史摘要。"},
+            scripts={"scripts/check.py": "print('check')\n"},
+        )
+
+        updated = self.memory.api.skill.update(
+            skill["id"],
+            description="管理发布说明并补充风险提示。",
+            references={"references/risk.md": "发布前必须补充回滚步骤。"},
+        )
+
+        latest = updated["versions"][0]
+        file_paths = {item["relative_path"] for item in latest["files"]}
+        self.assertIn("references/base.md", file_paths)
+        self.assertIn("references/risk.md", file_paths)
+        self.assertIn("scripts/check.py", file_paths)
+        self.assertGreaterEqual(len(updated["versions"]), 2)
+
+        search = self.memory.api.skill.search(
+            "回滚步骤 风险提示",
+            owner_agent_id="agent.alpha",
+            subject_type="agent",
+            subject_id="agent.alpha",
+        )
+        self.assertTrue(search["results"])
+        self.assertEqual(search["results"][0]["skill_id"], skill["id"])
+
 
 class AsyncStructuredAPITest(unittest.TestCase):
     def test_async_grouped_api(self) -> None:

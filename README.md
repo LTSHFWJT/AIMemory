@@ -200,6 +200,15 @@ pip install .[all]
 
 `ScopedAIMemory` 同样支持 `scoped.api.*`。
 
+其中 `api.skill` 现已支持 skill package 形式的本地文件主存储：
+
+- `SKILL.md`
+- `references/*`
+- `scripts/*`
+- `assets/*`
+
+`references` 文本会进入辅助语义索引以提升 `skill.search()` 召回，但真实文件仍保存在本地对象存储中。
+
 旧的平铺方法不再作为对外接口，统一使用 `memory.api.*` / `scoped.api.*`。
 
 这些接口会自动沿用：

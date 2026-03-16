@@ -244,6 +244,9 @@ skill = memory.api.skill.add(
     subject_id="agent.assistant",
     tools=["search", "summarize"],
     topics=["compression", "memory"],
+    references={
+        "references/style-guide.md": "输出必须先给结论，再给步骤，最后给风险提示。",
+    },
 )
 
 result = memory.api.skill.search(
@@ -260,6 +263,7 @@ result = memory.api.skill.search(
 - 工作流
 - 工具组合
 - 成功经验
+- `SKILL.md / references / scripts / assets` 形式的技能包文件
 
 ## 10. 做归档
 

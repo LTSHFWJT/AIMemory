@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any
 from aimemory.core.text import chunk_text
 from aimemory.core.utils import json_dumps, json_loads, make_id, make_uuid7, merge_metadata, utcnow_iso
 from aimemory.domains.memory.models import MemoryScope, MemoryType
+from aimemory.domains.skill.package import looks_like_skill_file_mapping
 
 if TYPE_CHECKING:
     from aimemory.core.facade import AIMemory
@@ -762,12 +763,41 @@ class AgentStoreAPI:
     ) -> dict[str, Any]:
         return self.memory.search_skills(query, limit=limit, threshold=threshold, **scope_kwargs)
 
+    def search_skill_references(
+        self,
+        query: str,
+        *,
+        skill_id: str | None = None,
+        skill_version_id: str | None = None,
+        path_prefix: str | None = None,
+        limit: int = 10,
+        threshold: float = 0.0,
+        **scope_kwargs: Any,
+    ) -> dict[str, Any]:
+        return self.memory.search_skill_references(
+            query,
+            skill_id=skill_id,
+            skill_version_id=skill_version_id,
+            path_prefix=path_prefix,
+            limit=limit,
+            threshold=threshold,
+            **scope_kwargs,
+        )
+
     def update_skill(self, skill_id: str, **kwargs: Any) -> dict[str, Any]:
         skill = self.get_skill_content(skill_id)
         name = str(kwargs.pop("name", skill["name"]))
         description = str(kwargs.pop("description", skill["description"]))
         status = str(kwargs.pop("status", skill.get("status", "active")))
         metadata = merge_metadata(skill.get("metadata"), kwargs.pop("metadata", None))
+        raw_assets = kwargs.pop("assets", None)
+        skill_markdown = kwargs.pop("skill_markdown", None)
+        files = list(kwargs.pop("files", []) or [])
+        references = kwargs.pop("references", None)
+        scripts = kwargs.pop("scripts", None)
+        asset_files = raw_assets if looks_like_skill_file_mapping(raw_assets) else None
+        if raw_assets is not None and asset_files is None:
+            metadata["assets"] = raw_assets
         global_scope = bool(kwargs.pop("global_scope", False))
         scope = self.memory._resolve_scope(
             owner_agent_id=kwargs.pop("owner_agent_id", skill.get("owner_agent_id") or skill.get("owner_id")),
@@ -797,29 +827,70 @@ class AgentStoreAPI:
                 skill_id,
             ),
         )
-        version_fields = {
-            "version": kwargs.pop("version", None),
-            "prompt_template": kwargs.pop("prompt_template", None),
-            "workflow": kwargs.pop("workflow", None),
-            "schema": kwargs.pop("schema", None),
-            "tools": kwargs.pop("tools", None),
-            "tests": kwargs.pop("tests", None),
-            "topics": kwargs.pop("topics", None),
-        }
-        if any(value is not None for value in version_fields.values()):
+        latest_version = skill["versions"][0] if skill.get("versions") else {}
+        latest_payload = self.memory._load_skill_version_asset(latest_version)
+        sentinel = object()
+        raw_version = kwargs.pop("version", sentinel)
+        raw_prompt_template = kwargs.pop("prompt_template", sentinel)
+        raw_workflow = kwargs.pop("workflow", sentinel)
+        raw_schema = kwargs.pop("schema", sentinel)
+        raw_tools = kwargs.pop("tools", sentinel)
+        raw_tests = kwargs.pop("tests", sentinel)
+        raw_topics = kwargs.pop("topics", sentinel)
+
+        resolved_prompt_template = latest_version.get("prompt_template") if raw_prompt_template is sentinel else raw_prompt_template
+        resolved_workflow = latest_payload.get("workflow", latest_version.get("workflow")) if raw_workflow is sentinel else raw_workflow
+        resolved_schema = latest_payload.get("schema", latest_version.get("schema_json") or {}) if raw_schema is sentinel else raw_schema
+        resolved_tools = list(latest_payload.get("tools", []) if raw_tools is sentinel else raw_tools or [])
+        resolved_tests = list(latest_payload.get("tests", []) if raw_tests is sentinel else raw_tests or [])
+        resolved_topics = list(latest_payload.get("topics", []) if raw_topics is sentinel else raw_topics or [])
+
+        package_changed = bool(files) or any(item is not None for item in (skill_markdown, references, scripts, asset_files))
+        content_changed = (
+            raw_version is not sentinel
+            or raw_prompt_template is not sentinel
+            or raw_workflow is not sentinel
+            or raw_schema is not sentinel
+            or raw_tools is not sentinel
+            or raw_tests is not sentinel
+            or raw_topics is not sentinel
+            or package_changed
+            or name != skill["name"]
+            or description != skill["description"]
+        )
+        if content_changed:
+            base_files = (
+                self.memory._clone_skill_version_file_inputs(
+                    skill_version_id=latest_version["id"],
+                    name=name,
+                    description=description,
+                    prompt_template=resolved_prompt_template,
+                    workflow=resolved_workflow,
+                    tools=resolved_tools,
+                    topics=resolved_topics,
+                )
+                if latest_version.get("id")
+                else None
+            )
             self._write_skill_version(
                 skill_id=skill_id,
                 name=name,
                 description=description,
                 scope=scope,
                 metadata=metadata or {},
-                version=version_fields["version"],
-                prompt_template=version_fields["prompt_template"],
-                workflow=version_fields["workflow"],
-                schema=version_fields["schema"],
-                tools=list(version_fields["tools"] or []),
-                tests=list(version_fields["tests"] or []),
-                topics=list(version_fields["topics"] or []),
+                version=None if raw_version is sentinel else raw_version,
+                prompt_template=resolved_prompt_template,
+                workflow=resolved_workflow,
+                schema=resolved_schema,
+                tools=resolved_tools,
+                tests=resolved_tests,
+                topics=resolved_topics,
+                skill_markdown=skill_markdown,
+                base_files=base_files,
+                files=files,
+                references=references,
+                scripts=scripts,
+                assets=asset_files,
                 now=now,
             )
         return self.get_skill_content(skill_id)
@@ -830,6 +901,7 @@ class AgentStoreAPI:
             self.memory.db.execute("DELETE FROM skill_index WHERE record_id = ?", (version["id"],))
             self.memory.db.execute("DELETE FROM semantic_index_cache WHERE record_id = ?", (version["id"],))
             self.memory.vector_index.delete("skill_index", version["id"])
+            self.memory._delete_skill_version_artifacts(version["id"])
         self.memory.graph_store.delete_reference(skill_id)
         self.memory.db.execute(
             """
@@ -1209,89 +1281,32 @@ class AgentStoreAPI:
         tools: list[str],
         tests: list[dict[str, Any]],
         topics: list[str],
+        skill_markdown: str | None,
+        base_files: list[dict[str, Any]] | None,
+        files: list[dict[str, Any]] | None,
+        references: dict[str, Any] | list[dict[str, Any]] | None,
+        scripts: dict[str, Any] | list[dict[str, Any]] | None,
+        assets: dict[str, Any] | list[dict[str, Any]] | None,
         now: str,
     ) -> None:
-        existing_count = int(
-            self.memory.db.fetch_one("SELECT COUNT(*) AS count FROM skill_versions WHERE skill_id = ?", (skill_id,)).get("count", 0)
-        )
-        resolved_version = version or f"v{existing_count + 1}"
-        asset_payload = {
-            "name": name,
-            "description": description,
-            "workflow": workflow,
-            "schema": schema,
-            "tools": tools,
-            "topics": topics,
-            "tests": tests,
-            "metadata": metadata,
-        }
-        stored = self.memory.object_store.put_text(
-            json_dumps(asset_payload),
-            object_type="skills",
-            suffix=".json",
-            prefix=self.memory._object_store_prefix(scope, "skill"),
-        )
-        object_row = self.memory._persist_object(
-            stored,
-            mime_type="application/json",
-            metadata={"skill_id": skill_id, **self.memory._scope_metadata(scope), **metadata},
-        )
-        version_id = make_id("skillver")
-        workflow_text = workflow if isinstance(workflow, str) else json_dumps(workflow or {})
-        self.memory.db.execute(
-            """
-            INSERT INTO skill_versions(id, skill_id, version, prompt_template, workflow, schema_json, object_id, changelog, metadata, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                version_id,
-                skill_id,
-                resolved_version,
-                prompt_template,
-                workflow_text,
-                json_dumps(schema or {}),
-                object_row["id"],
-                None,
-                json_dumps(metadata or {}),
-                now,
-            ),
-        )
-        for tool_name in tools:
-            self.memory.db.execute(
-                """
-                INSERT INTO skill_bindings(id, skill_version_id, tool_name, binding_type, config, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (make_id("bind"), version_id, tool_name, "tool", json_dumps({}), now),
-            )
-        for test_case in tests:
-            self.memory.db.execute(
-                """
-                INSERT INTO skill_tests(id, skill_version_id, input_payload, expected_output, metadata, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    make_id("stest"),
-                    version_id,
-                    json_dumps(test_case.get("input", {})),
-                    json_dumps(test_case.get("expected")),
-                    json_dumps(test_case.get("metadata", {})),
-                    now,
-                ),
-            )
-        self.memory._index_skill(
-            {
-                "record_id": version_id,
-                "skill_id": skill_id,
-                "version": resolved_version,
-                "owner_agent_id": scope.get("owner_agent_id"),
-                "source_subject_type": scope.get("subject_type"),
-                "source_subject_id": scope.get("subject_id"),
-                "namespace_key": scope.get("namespace_key"),
-                "name": name,
-                "description": description,
-                "text": "\n".join(part for part in [name, description, prompt_template or "", workflow_text, " ".join(topics), " ".join(tools)] if part),
-                "metadata": metadata or {},
-                "updated_at": now,
-            }
+        self.memory._write_skill_version_record(
+            skill_id=skill_id,
+            name=name,
+            description=description,
+            scope=scope,
+            metadata=metadata,
+            version=version,
+            prompt_template=prompt_template,
+            workflow=workflow,
+            schema=schema,
+            tools=tools,
+            tests=tests,
+            topics=topics,
+            skill_markdown=skill_markdown,
+            base_files=base_files,
+            files=files,
+            references=references,
+            scripts=scripts,
+            assets=assets,
+            now=now,
         )

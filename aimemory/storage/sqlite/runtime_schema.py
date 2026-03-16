@@ -120,6 +120,57 @@ EXTRA_SCHEMA_STATEMENTS = [
         metadata TEXT
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS skill_files (
+        id TEXT PRIMARY KEY,
+        skill_id TEXT NOT NULL,
+        skill_version_id TEXT NOT NULL,
+        object_id TEXT NOT NULL,
+        relative_path TEXT NOT NULL,
+        role TEXT NOT NULL,
+        mime_type TEXT,
+        size_bytes INTEGER NOT NULL,
+        checksum TEXT NOT NULL,
+        metadata TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE(skill_version_id, relative_path)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS skill_reference_chunks (
+        id TEXT PRIMARY KEY,
+        skill_id TEXT NOT NULL,
+        skill_version_id TEXT NOT NULL,
+        file_id TEXT NOT NULL,
+        object_id TEXT NOT NULL,
+        relative_path TEXT NOT NULL,
+        chunk_index INTEGER NOT NULL,
+        title TEXT,
+        content TEXT NOT NULL,
+        metadata TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE(file_id, chunk_index)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS skill_reference_index (
+        record_id TEXT PRIMARY KEY,
+        skill_id TEXT NOT NULL,
+        skill_version_id TEXT NOT NULL,
+        file_id TEXT NOT NULL,
+        object_id TEXT NOT NULL,
+        owner_agent_id TEXT,
+        source_subject_type TEXT,
+        source_subject_id TEXT,
+        namespace_key TEXT,
+        relative_path TEXT NOT NULL,
+        title TEXT,
+        text TEXT NOT NULL,
+        keywords TEXT,
+        updated_at TEXT NOT NULL,
+        metadata TEXT
+    )
+    """,
 ]
 
 POST_MIGRATION_SCHEMA_STATEMENTS = [
@@ -134,6 +185,12 @@ POST_MIGRATION_SCHEMA_STATEMENTS = [
     "CREATE INDEX IF NOT EXISTS idx_documents_namespace ON documents(namespace_key, updated_at)",
     "CREATE INDEX IF NOT EXISTS idx_skills_owner ON skills(owner_agent_id, updated_at)",
     "CREATE INDEX IF NOT EXISTS idx_skills_namespace ON skills(namespace_key, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_skill_files_version ON skill_files(skill_version_id, relative_path)",
+    "CREATE INDEX IF NOT EXISTS idx_skill_files_skill ON skill_files(skill_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_skill_ref_chunks_version ON skill_reference_chunks(skill_version_id, relative_path, chunk_index)",
+    "CREATE INDEX IF NOT EXISTS idx_skill_ref_index_skill ON skill_reference_index(skill_id, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_skill_ref_index_owner ON skill_reference_index(owner_agent_id, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_skill_ref_index_namespace ON skill_reference_index(namespace_key, updated_at)",
     "CREATE INDEX IF NOT EXISTS idx_memory_index_owner ON memory_index(owner_agent_id, subject_type, subject_id, updated_at)",
     "CREATE INDEX IF NOT EXISTS idx_memory_index_namespace ON memory_index(namespace_key, updated_at)",
     "CREATE INDEX IF NOT EXISTS idx_knowledge_index_owner ON knowledge_chunk_index(owner_agent_id, updated_at)",

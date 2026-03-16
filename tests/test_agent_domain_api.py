@@ -3,8 +3,7 @@ from __future__ import annotations
 import unittest
 from tempfile import TemporaryDirectory
 
-from aimemory import AIMemory, register_relational_backend
-from aimemory.storage.sqlite.database import SQLiteDatabase
+from aimemory import AIMemory
 
 
 class AgentDomainAPITest(unittest.TestCase):
@@ -202,18 +201,13 @@ class AgentDomainAPITest(unittest.TestCase):
         )
         manifest = adapter.call_tool("aimemory_manifest", {})
         self.assertEqual(manifest["storage"]["relational_backend"], "sqlite")
+        self.assertEqual(manifest["storage"]["index_backend"], "lancedb")
+        self.assertEqual(manifest["storage"]["graph_backend"], "disabled")
         mcp_list = adapter.call_tool("long_term_memory_list", {"limit": 10})
         self.assertTrue(isinstance(mcp_list["results"], list))
 
         deleted = self.memory.api.skill.delete(skill["id"])
         self.assertTrue(deleted["deleted"])
-
-    def test_relational_backend_plugin_registration(self) -> None:
-        register_relational_backend("sqlite_alias", lambda config: SQLiteDatabase(config.sqlite_path))
-        with TemporaryDirectory() as tmp:
-            memory = AIMemory({"root_dir": tmp, "relational_backend": "sqlite_alias"})
-            self.assertEqual(memory.storage_layout()["relational_backend"], "sqlite_alias")
-            memory.close()
 
 
 if __name__ == "__main__":

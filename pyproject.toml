@@ -20,22 +20,19 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
 ]
-dependencies = ["lmdb"]
+dependencies = [
+  "lmdb",
+  "lancedb>=0.16.0",
+]
 
 [project.optional-dependencies]
 embeddings = ["sentence-transformers>=2.7.0"]
 litellm = ["litellm>=1.52.0"]
 mcp = ["mcp>=1.0.0"]
-lancedb = ["lancedb>=0.16.0"]
-faiss = ["faiss-cpu>=1.8.0"]
-kuzu = ["kuzu>=0.5.0"]
 all = [
   "sentence-transformers>=2.7.0",
   "litellm>=1.52.0",
   "mcp>=1.0.0",
-  "lancedb>=0.16.0",
-  "faiss-cpu>=1.8.0",
-  "kuzu>=0.5.0",
 ]
 
 [tool.setuptools.packages.find]

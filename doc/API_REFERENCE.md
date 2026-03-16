@@ -293,11 +293,11 @@ await memory.close()
 
 | 方法 | 用途 | 主要参数 |
 | --- | --- | --- |
-| `add(name, description, **kwargs)` | 新增技能 | `name`、`description`、`version`、`prompt_template`、`workflow`、`schema`、`tools`、`tests`、`topics`、`metadata`、`status`、作用域参数 |
+| `add(name, description, **kwargs)` | 新增技能 | `name`、`description`、`version`、`prompt_template`、`workflow`、`schema`、`tools`、`tests`、`topics`、`skill_markdown`、`files`、`references`、`scripts`、`assets`、`metadata`、`status`、作用域参数 |
 | `get(skill_id)` | 获取完整技能内容 | `skill_id` |
 | `list(**kwargs)` | 列出技能 metadata | `owner_agent_id`、`subject_type`、`subject_id`、`status`、`limit`、`offset`、作用域参数 |
-| `search(query, **kwargs)` | 搜索技能 | `query`、`limit`、`threshold`、作用域参数 |
-| `update(skill_id, **kwargs)` | 更新技能并可写入新版本 | `name`、`description`、`version`、`prompt_template`、`workflow`、`schema`、`tools`、`tests`、`topics`、`metadata`、`status`、作用域参数 |
+| `search(query, **kwargs)` | 搜索技能 | `query`、`limit`、`threshold`、作用域参数；会联合 skill 主体和 `references/` 文本命中 |
+| `update(skill_id, **kwargs)` | 更新技能并可写入新版本 | `name`、`description`、`version`、`prompt_template`、`workflow`、`schema`、`tools`、`tests`、`topics`、`skill_markdown`、`files`、`references`、`scripts`、`assets`、`metadata`、`status`、作用域参数 |
 | `delete(skill_id)` | 删除技能 | `skill_id` |
 
 `status` 固定枚举值：
@@ -306,6 +306,12 @@ await memory.close()
 - `active`
 - `deprecated`
 - `archived`
+
+补充说明：
+
+- skill 现在支持以“本地文件主存储”的方式保存技能包，完整文件清单会随版本返回。
+- `SKILL.md` 是主入口；如果未显式传入，会根据 `name/description/prompt_template/workflow` 自动生成。
+- `references` 文本会被切块进入辅助检索索引，从而提升 `api.skill.search()` 的召回，但真实文件仍保存在本地对象存储。
 
 ## 10. `api.archive`
 
