@@ -66,6 +66,9 @@ class AgentDomainAPITest(unittest.TestCase):
             self.memory.memory_content_store.get_text("long_term", long_term_meta["content_id"]),
             "用户偏好简洁分点回答，并且希望所有输出都尽量先给结论。",
         )
+        memory_index_row = self.memory.db.fetch_one("SELECT text FROM memory_index WHERE record_id = ?", (human["id"],))
+        self.assertIsNotNone(memory_index_row)
+        self.assertIn("用户偏好简洁分点回答", memory_index_row["text"])
         self.assertIsNone(
             self.memory.db.fetch_one("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'memories'")
         )
@@ -208,6 +211,79 @@ class AgentDomainAPITest(unittest.TestCase):
 
         deleted = self.memory.api.skill.delete(skill["id"])
         self.assertTrue(deleted["deleted"])
+
+    def test_fts_retrieval_recovers_older_interaction_and_execution_records(self) -> None:
+        session = self.memory.api.session.create(
+            owner_agent_id="agent.alpha",
+            subject_type="human",
+            subject_id="user-1",
+            title="fts-demo",
+        )
+        interaction_phrase = "稀有交互短语：全链路配额折叠策略"
+        self.memory.api.session.append(
+            session["id"],
+            "user",
+            interaction_phrase,
+            auto_capture=False,
+            auto_compress=False,
+        )
+        for index in range(14):
+            self.memory.api.session.append(
+                session["id"],
+                "user",
+                f"普通交互上下文 {index}",
+                auto_capture=False,
+                auto_compress=False,
+            )
+
+        interaction_result = self.memory.api.recall.query(
+            interaction_phrase,
+            owner_agent_id="agent.alpha",
+            subject_type="human",
+            subject_id="user-1",
+            session_id=session["id"],
+            domains=["interaction"],
+            limit=3,
+        )
+        self.assertTrue(any(interaction_phrase in item.get("text", "") for item in interaction_result["results"]))
+
+        execution_phrase = "稀有执行目标：回滚编排口令"
+        self.memory.api.execution.start_run(
+            user_id="user-1",
+            goal=execution_phrase,
+            owner_agent_id="agent.alpha",
+            subject_type="human",
+            subject_id="user-1",
+        )
+        for index in range(84):
+            self.memory.api.execution.start_run(
+                user_id="user-1",
+                goal=f"普通执行目标 {index}",
+                owner_agent_id="agent.alpha",
+                subject_type="human",
+                subject_id="user-1",
+            )
+
+        execution_result = self.memory.api.execution.search(
+            execution_phrase,
+            user_id="user-1",
+            owner_agent_id="agent.alpha",
+            session_id=None,
+            limit=3,
+        )
+        self.assertTrue(any(execution_phrase in item.get("text", "") for item in execution_result["results"]))
+        self.assertGreaterEqual(
+            self.memory.db.fetch_one(
+                "SELECT COUNT(*) AS count FROM text_search_index WHERE collection = 'interaction_turn'"
+            )["count"],
+            15,
+        )
+        self.assertGreaterEqual(
+            self.memory.db.fetch_one(
+                "SELECT COUNT(*) AS count FROM text_search_index WHERE collection = 'execution_run'"
+            )["count"],
+            85,
+        )
 
 
 if __name__ == "__main__":
