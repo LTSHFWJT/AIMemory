@@ -198,6 +198,137 @@ class StructuredAPITest(unittest.TestCase):
         self.assertTrue(search["results"])
         self.assertEqual(search["results"][0]["skill_id"], skill["id"])
 
+    def test_structured_chunking_persists_section_context(self) -> None:
+        document = self.memory.api.knowledge.add(
+            "发布操作手册",
+            """
+            # 准备
+            1. 检查配置文件和数据库连接。
+            2. 记录当前版本号并确认备份可用。
+
+            # 回滚
+            1. 恢复数据库快照。
+            2. 重新启动服务并验证健康检查。
+            """,
+            owner_agent_id="agent.alpha",
+            subject_type="human",
+            subject_id="user-1",
+            chunk_size=90,
+            chunk_overlap=20,
+        )
+        self.assertTrue(document["chunks"])
+        document_sections = [chunk["metadata"].get("section_titles") or [] for chunk in document["chunks"]]
+        self.assertTrue(any("准备" in sections for sections in document_sections))
+        self.assertTrue(any("回滚" in sections for sections in document_sections))
+
+        indexed_titles = [
+            row["title"]
+            for row in self.memory.db.fetch_all(
+                "SELECT title FROM knowledge_chunk_index WHERE document_id = ? ORDER BY updated_at ASC",
+                (document["id"],),
+            )
+        ]
+        self.assertTrue(any("准备" in title for title in indexed_titles))
+        self.assertTrue(any("回滚" in title for title in indexed_titles))
+
+        skill = self.memory.api.skill.add(
+            "release_sections",
+            "带章节的发布参考资料。",
+            owner_agent_id="agent.alpha",
+            subject_type="agent",
+            subject_id="agent.alpha",
+            references={
+                "references/release.md": """
+                # 准备
+                发布前先跑 health-check 并核对版本号。
+
+                # 回滚
+                失败后恢复快照，并重新校验接口状态。
+                """,
+            },
+        )
+        skill_reference_search = self.memory.api.skill.search_references(
+            "回滚 快照 接口状态",
+            owner_agent_id="agent.alpha",
+            subject_type="agent",
+            subject_id="agent.alpha",
+            skill_id=skill["id"],
+        )
+        self.assertTrue(skill_reference_search["results"])
+        self.assertIn("回滚", skill_reference_search["results"][0]["title"])
+
+    def test_algorithmic_long_text_compression_endpoints(self) -> None:
+        compressed = self.memory.api.recall.compress_text(
+            """
+            # 发布流程
+
+            1. 先执行预检查脚本，确认配置文件完整。
+            2. 再执行发布命令，并记录版本号 v2.4.1。
+            3. 如果失败，必须按照回滚步骤恢复数据库。
+
+            约束：
+            - CPU 使用率不得超过 70%
+            - 发布窗口限制在 30 分钟内
+            """,
+            domain_hint="skill_reference",
+            query="发布 回滚 版本 约束",
+            budget_chars=180,
+        )
+        self.assertTrue(compressed["summary"])
+        self.assertTrue(compressed["highlights"])
+        self.assertTrue(compressed["steps"])
+        self.assertTrue(compressed["constraints"])
+        self.assertTrue(compressed["selected_unit_ids"])
+
+        document = self.memory.api.knowledge.add(
+            "发布规范",
+            """
+            发布前必须完成预检查，并输出版本号 v3.2.0。
+            数据迁移期间 CPU 使用率不得超过 65%。
+            如失败，必须执行标准回滚流程。
+            """,
+            owner_agent_id="agent.alpha",
+            subject_type="human",
+            subject_id="user-1",
+        )
+        document_compression = self.memory.api.knowledge.compress(
+            document["id"],
+            query="版本号 回滚 CPU",
+            budget_chars=180,
+        )
+        self.assertEqual(document_compression["document_id"], document["id"])
+        self.assertTrue(document_compression["summary"])
+        self.assertTrue(document_compression["constraints"])
+
+        skill = self.memory.api.skill.add(
+            "release_guard",
+            "执行发布前检查并在失败时回滚。",
+            owner_agent_id="agent.alpha",
+            subject_type="agent",
+            subject_id="agent.alpha",
+            references={
+                "references/release.md": """
+                发布步骤：
+                1. 执行 health-check
+                2. 记录版本号 v5.0.0
+                3. 如果失败，立即回滚
+
+                限制：
+                - 发布窗口 20 分钟
+                - 错误率不得超过 1%
+                """,
+            },
+        )
+        skill_compression = self.memory.api.skill.compress_references(
+            skill["id"],
+            query="回滚 版本号 错误率",
+            budget_chars=200,
+        )
+        self.assertEqual(skill_compression["skill_id"], skill["id"])
+        self.assertTrue(skill_compression["summary"])
+        self.assertTrue(skill_compression["steps"])
+        self.assertTrue(skill_compression["constraints"])
+
 
 class AsyncStructuredAPITest(unittest.TestCase):
     def test_async_grouped_api(self) -> None:

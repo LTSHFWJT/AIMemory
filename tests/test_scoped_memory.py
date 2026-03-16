@@ -146,6 +146,17 @@ class ScopedMemoryTests(unittest.TestCase):
                 manifest = adapter.manifest()
                 self.assertEqual(manifest["default_scope"]["workspace_id"], "ws.alpha")
                 self.assertTrue(any("concise markdown bullets" in item.get("text", "") for item in result["results"]))
+                compressed = adapter.call_tool(
+                    "text_compress",
+                    {
+                        "text": "发布前先做检查，再执行命令。如果失败，必须立即回滚。",
+                        "query": "检查 回滚",
+                        "domain_hint": "skill_reference",
+                        "budget_chars": 120,
+                    },
+                )
+                self.assertTrue(compressed["summary"])
+                self.assertIn("text_compress", {tool["name"] for tool in manifest["tools"]})
 
 
 if __name__ == "__main__":
