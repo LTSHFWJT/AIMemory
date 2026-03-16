@@ -20,7 +20,7 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
 ]
-dependencies = []
+dependencies = ["lmdb"]
 
 [project.optional-dependencies]
 embeddings = ["sentence-transformers>=2.7.0"]

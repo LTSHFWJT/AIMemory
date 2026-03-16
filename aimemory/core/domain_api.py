@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from aimemory.core.text import chunk_text
-from aimemory.core.utils import json_dumps, json_loads, make_id, merge_metadata, utcnow_iso
+from aimemory.core.utils import json_dumps, json_loads, make_id, make_uuid7, merge_metadata, utcnow_iso
 from aimemory.domains.memory.models import MemoryScope, MemoryType
 
 if TYPE_CHECKING:
@@ -296,24 +296,16 @@ class AgentStoreAPI:
             "metadata": metadata,
             "scope": scope,
         }
-        stored = self.memory.object_store.put_text(
-            json_dumps(payload),
-            object_type="archive",
-            suffix=".json",
-            prefix=self.memory._object_store_prefix(scope, "archive"),
-        )
-        object_row = self.memory._persist_object(
-            stored,
-            mime_type="application/json",
-            metadata={"archive_unit_id": archive_id, **self.memory._scope_metadata(scope), **metadata},
-        )
+        content_id = make_uuid7()
+        self.memory.memory_content_store.put_json("archive", payload, key=content_id)
         self.memory.db.execute(
             """
-            INSERT INTO archive_units(id, domain, source_id, user_id, owner_agent_id, subject_type, subject_id, interaction_type, namespace_key, source_type, session_id, object_id, summary, metadata, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO archive_memories(id, content_id, domain, source_id, user_id, owner_agent_id, subject_type, subject_id, interaction_type, namespace_key, source_type, session_id, summary, metadata, content_format, created_at, updated_at, last_rehydrated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 archive_id,
+                content_id,
                 archive_domain,
                 source_id,
                 scope.get("user_id"),
@@ -324,10 +316,12 @@ class AgentStoreAPI:
                 scope.get("namespace_key"),
                 source_type,
                 session_id,
-                object_row["id"],
                 summary,
                 json_dumps(merge_metadata(metadata, self.memory._scope_metadata(scope))),
+                "application/json",
                 now,
+                now,
+                None,
             ),
         )
         summary_id = make_id("archsum")
@@ -411,7 +405,7 @@ class AgentStoreAPI:
         if not include_generated:
             filters.append("(source_type IS NULL OR source_type != 'archive_compaction')")
         rows = self.memory.db.fetch_all(
-            f"SELECT * FROM archive_units WHERE {' AND '.join(filters)} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            f"SELECT * FROM archive_memories WHERE {' AND '.join(filters)} ORDER BY created_at DESC LIMIT ? OFFSET ?",
             tuple(params + [limit, offset]),
         )
         results = [self.memory.get_archive_unit(row["id"]) or _deserialize_row(row) for row in rows]
@@ -445,7 +439,6 @@ class AgentStoreAPI:
         content = kwargs.pop("content", None)
         source_type = str(kwargs.pop("source_type", archive.get("source_type") or "manual"))
         now = utcnow_iso()
-        object_id = archive.get("object_id")
         if content is not None:
             payload = {
                 "summary": summary,
@@ -453,22 +446,11 @@ class AgentStoreAPI:
                 "metadata": metadata,
                 "scope": scope,
             }
-            stored = self.memory.object_store.put_text(
-                json_dumps(payload),
-                object_type="archive",
-                suffix=".json",
-                prefix=self.memory._object_store_prefix(scope, "archive"),
-            )
-            object_row = self.memory._persist_object(
-                stored,
-                mime_type="application/json",
-                metadata={"archive_unit_id": archive_unit_id, **self.memory._scope_metadata(scope), **dict(metadata or {})},
-            )
-            object_id = object_row["id"]
+            self.memory.memory_content_store.put_json("archive", payload, key=archive["content_id"])
         self.memory.db.execute(
             """
-            UPDATE archive_units
-            SET user_id = ?, owner_agent_id = ?, subject_type = ?, subject_id = ?, interaction_type = ?, namespace_key = ?, source_type = ?, object_id = ?, summary = ?, metadata = ?
+            UPDATE archive_memories
+            SET user_id = ?, owner_agent_id = ?, subject_type = ?, subject_id = ?, interaction_type = ?, namespace_key = ?, source_type = ?, summary = ?, metadata = ?, updated_at = ?
             WHERE id = ?
             """,
             (
@@ -479,9 +461,9 @@ class AgentStoreAPI:
                 scope.get("interaction_type"),
                 scope.get("namespace_key"),
                 source_type,
-                object_id,
                 summary,
                 json_dumps(merge_metadata(metadata, self.memory._scope_metadata(scope))),
+                now,
                 archive_unit_id,
             ),
         )
@@ -529,7 +511,9 @@ class AgentStoreAPI:
             self.memory.vector_index.delete("archive_summary_index", summary["id"])
         self.memory.graph_store.delete_reference(archive_unit_id)
         self.memory.db.execute("DELETE FROM archive_summaries WHERE archive_unit_id = ?", (archive_unit_id,))
-        self.memory.db.execute("DELETE FROM archive_units WHERE id = ?", (archive_unit_id,))
+        if archive.get("content_id"):
+            self.memory.memory_content_store.delete("archive", archive["content_id"])
+        self.memory.db.execute("DELETE FROM archive_memories WHERE id = ?", (archive_unit_id,))
         return {"id": archive_unit_id, "deleted": True, "archive": archive}
 
     def compress_archive_memories(
@@ -1010,8 +994,8 @@ class AgentStoreAPI:
         )
 
     def _find_generated_memory(self, memory_scope: str, scope: dict[str, Any]) -> dict[str, Any] | None:
-        filters = ["status = 'active'", "source = 'auto_compression'", "scope = ?"]
-        params: list[Any] = [memory_scope]
+        filters = ["status = 'active'", "source = 'auto_compression'"]
+        params: list[Any] = []
         for column in ("owner_agent_id", "subject_type", "subject_id", "interaction_type", "namespace_key"):
             value = scope.get(column)
             if value is None:
@@ -1025,11 +1009,8 @@ class AgentStoreAPI:
             else:
                 filters.append("session_id = ?")
                 params.append(scope["session_id"])
-        row = self.memory.db.fetch_one(
-            f"SELECT * FROM memories WHERE {' AND '.join(filters)} ORDER BY updated_at DESC LIMIT 1",
-            tuple(params),
-        )
-        return _deserialize_row(row)
+        rows = self.memory._list_memory_rows(scope=memory_scope, filters=filters, params=params, limit=1)
+        return rows[0] if rows else None
 
     def _upsert_generated_memory(
         self,
@@ -1081,7 +1062,7 @@ class AgentStoreAPI:
     def _upsert_generated_archive(self, scope: dict[str, Any], compression: dict[str, Any]) -> dict[str, Any]:
         existing = self.memory.db.fetch_one(
             """
-            SELECT * FROM archive_units
+            SELECT * FROM archive_memories
             WHERE source_type = 'archive_compaction'
               AND COALESCE(owner_agent_id, '') = COALESCE(?, '')
               AND COALESCE(subject_type, '') = COALESCE(?, '')

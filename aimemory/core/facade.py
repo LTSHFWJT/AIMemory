@@ -13,12 +13,13 @@ from aimemory.core.capabilities import capability_dict
 from aimemory.core.scope import CollaborationScope
 from aimemory.core.settings import AIMemoryConfig
 from aimemory.core.text import build_summary, chunk_text, extract_keywords, split_sentences
-from aimemory.core.utils import json_dumps, json_loads, make_id, merge_metadata, utcnow_iso
+from aimemory.core.utils import json_dumps, json_loads, make_id, make_uuid7, merge_metadata, utcnow_iso
 from aimemory.domains.memory.models import MemoryScope, MemoryType
 from aimemory.memory_intelligence.models import MemoryScopeContext, NormalizedMessage
 from aimemory.providers.defaults import TextOnlyVisionProcessor
 from aimemory.providers.embeddings import configure_embedding_runtime, describe_embedding_runtime, embed_text
 from aimemory.querying.filters import filter_records
+from aimemory.storage.lmdb.store import LMDBMemoryStore
 from aimemory.storage.object_store.local import LocalObjectStore
 from aimemory.storage.plugins import STORAGE_PLUGIN_REGISTRY
 from aimemory.storage.sqlite.runtime_schema import ADDITIONAL_COLUMNS, EXTRA_SCHEMA_STATEMENTS, POST_MIGRATION_SCHEMA_STATEMENTS
@@ -79,13 +80,53 @@ def _domain_priority(domain: str) -> float:
     }.get(domain, 0.0)
 
 
+MEMORY_TABLE_MAP = {
+    str(MemoryScope.SESSION): "short_term_memories",
+    str(MemoryScope.LONG_TERM): "long_term_memories",
+}
+
+MEMORY_BUCKET_MAP = {
+    str(MemoryScope.SESSION): "short_term",
+    str(MemoryScope.LONG_TERM): "long_term",
+}
+
+MEMORY_TABLE_SELECT = """
+    SELECT
+        id,
+        content_id,
+        user_id,
+        agent_id,
+        owner_agent_id,
+        session_id,
+        run_id,
+        source_session_id,
+        source_run_id,
+        subject_type,
+        subject_id,
+        interaction_type,
+        namespace_key,
+        memory_type,
+        summary,
+        importance,
+        status,
+        source,
+        metadata,
+        content_format,
+        created_at,
+        updated_at,
+        archived_at
+    FROM {table}
+"""
+
+
 class AIMemory:
     def __init__(self, config: AIMemoryConfig | dict[str, Any] | None = None):
         self.config = AIMemoryConfig.from_value(config)
         configure_embedding_runtime(self.config.embeddings)
+        self.memory_content_store = LMDBMemoryStore(self.config.lmdb_path)
+        self.object_store = LocalObjectStore(self.config.object_store_path)
         self.db = STORAGE_PLUGIN_REGISTRY.create_relational(self.config.relational_backend, self.config)
         self._ensure_runtime_schema()
-        self.object_store = LocalObjectStore(self.config.object_store_path)
         BACKEND_REGISTRY.bootstrap_defaults()
         self.vector_index = BACKEND_REGISTRY.create_vector(self._resolve_vector_backend_name(), db=self.db, config=self.config)
         self.graph_store = BACKEND_REGISTRY.create_graph(self._resolve_graph_backend_name(), db=self.db, config=self.config)
@@ -131,60 +172,154 @@ class AIMemory:
             """
         )
         self.db.execute("UPDATE runs SET owner_agent_id = COALESCE(owner_agent_id, agent_id) WHERE owner_agent_id IS NULL")
-        self.db.execute("UPDATE memories SET owner_agent_id = COALESCE(owner_agent_id, agent_id) WHERE owner_agent_id IS NULL")
-        self.db.execute("UPDATE memories SET source_session_id = COALESCE(source_session_id, session_id) WHERE source_session_id IS NULL")
-        self.db.execute("UPDATE memories SET source_run_id = COALESCE(source_run_id, run_id) WHERE source_run_id IS NULL")
-        self.db.execute(
-            """
-            UPDATE memories
-            SET subject_type = COALESCE(subject_type, (SELECT s.subject_type FROM sessions s WHERE s.id = memories.session_id), 'human')
-            WHERE subject_type IS NULL
-            """
-        )
-        self.db.execute(
-            """
-            UPDATE memories
-            SET subject_id = COALESCE(subject_id, (SELECT s.subject_id FROM sessions s WHERE s.id = memories.session_id), user_id)
-            WHERE subject_id IS NULL
-            """
-        )
-        self.db.execute(
-            """
-            UPDATE memories
-            SET interaction_type = COALESCE(interaction_type, (SELECT s.interaction_type FROM sessions s WHERE s.id = memories.session_id), 'human_agent')
-            WHERE interaction_type IS NULL
-            """
-        )
+        self._normalize_memory_management_tables()
         self.db.execute("UPDATE skills SET owner_agent_id = COALESCE(owner_agent_id, owner_id) WHERE owner_agent_id IS NULL")
+        self._normalize_archive_management_table()
+
+    def _normalize_memory_management_tables(self) -> None:
+        for table_name in MEMORY_TABLE_MAP.values():
+            self.db.execute(f"UPDATE {table_name} SET owner_agent_id = COALESCE(owner_agent_id, agent_id) WHERE owner_agent_id IS NULL")
+            self.db.execute(f"UPDATE {table_name} SET source_session_id = COALESCE(source_session_id, session_id) WHERE source_session_id IS NULL")
+            self.db.execute(f"UPDATE {table_name} SET source_run_id = COALESCE(source_run_id, run_id) WHERE source_run_id IS NULL")
+            self.db.execute(
+                f"""
+                UPDATE {table_name}
+                SET subject_type = COALESCE(subject_type, (SELECT s.subject_type FROM sessions s WHERE s.id = {table_name}.session_id), 'human')
+                WHERE subject_type IS NULL
+                """
+            )
+            self.db.execute(
+                f"""
+                UPDATE {table_name}
+                SET subject_id = COALESCE(subject_id, (SELECT s.subject_id FROM sessions s WHERE s.id = {table_name}.session_id), user_id)
+                WHERE subject_id IS NULL
+                """
+            )
+            self.db.execute(
+                f"""
+                UPDATE {table_name}
+                SET interaction_type = COALESCE(interaction_type, (SELECT s.interaction_type FROM sessions s WHERE s.id = {table_name}.session_id), 'human_agent')
+                WHERE interaction_type IS NULL
+                """
+            )
+
+    def _normalize_archive_management_table(self) -> None:
         self.db.execute(
             """
-            UPDATE archive_units
-            SET owner_agent_id = COALESCE(owner_agent_id, (SELECT s.owner_agent_id FROM sessions s WHERE s.id = archive_units.session_id))
+            UPDATE archive_memories
+            SET owner_agent_id = COALESCE(owner_agent_id, (SELECT s.owner_agent_id FROM sessions s WHERE s.id = archive_memories.session_id))
             WHERE owner_agent_id IS NULL
             """
         )
         self.db.execute(
             """
-            UPDATE archive_units
-            SET subject_type = COALESCE(subject_type, (SELECT s.subject_type FROM sessions s WHERE s.id = archive_units.session_id))
+            UPDATE archive_memories
+            SET subject_type = COALESCE(subject_type, (SELECT s.subject_type FROM sessions s WHERE s.id = archive_memories.session_id))
             WHERE subject_type IS NULL
             """
         )
         self.db.execute(
             """
-            UPDATE archive_units
-            SET subject_id = COALESCE(subject_id, (SELECT s.subject_id FROM sessions s WHERE s.id = archive_units.session_id))
+            UPDATE archive_memories
+            SET subject_id = COALESCE(subject_id, (SELECT s.subject_id FROM sessions s WHERE s.id = archive_memories.session_id))
             WHERE subject_id IS NULL
             """
         )
         self.db.execute(
             """
-            UPDATE archive_units
-            SET interaction_type = COALESCE(interaction_type, (SELECT s.interaction_type FROM sessions s WHERE s.id = archive_units.session_id))
+            UPDATE archive_memories
+            SET interaction_type = COALESCE(interaction_type, (SELECT s.interaction_type FROM sessions s WHERE s.id = archive_memories.session_id))
             WHERE interaction_type IS NULL
             """
         )
-        self.db.execute("UPDATE archive_units SET source_type = COALESCE(source_type, domain) WHERE source_type IS NULL")
+        self.db.execute("UPDATE archive_memories SET source_type = COALESCE(source_type, domain) WHERE source_type IS NULL")
+
+    def _memory_table_for_scope(self, scope: str) -> str:
+        return MEMORY_TABLE_MAP.get(scope, MEMORY_TABLE_MAP[str(MemoryScope.LONG_TERM)])
+
+    def _memory_bucket_for_scope(self, scope: str) -> str:
+        return MEMORY_BUCKET_MAP.get(scope, MEMORY_BUCKET_MAP[str(MemoryScope.LONG_TERM)])
+
+    def _memory_scope_from_table(self, table_name: str) -> str:
+        for scope, candidate in MEMORY_TABLE_MAP.items():
+            if candidate == table_name:
+                return scope
+        return str(MemoryScope.LONG_TERM)
+
+    def _memory_table_for_id(self, memory_id: str) -> str | None:
+        for table_name in MEMORY_TABLE_MAP.values():
+            if self.db.fetch_one(f"SELECT id FROM {table_name} WHERE id = ?", (memory_id,)):
+                return table_name
+        return None
+
+    def _memory_row_sql(self, table_name: str) -> str:
+        return MEMORY_TABLE_SELECT.format(table=table_name)
+
+    def _memory_row_with_scope(self, table_name: str, row: dict[str, Any] | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        item = dict(row)
+        item["scope"] = self._memory_scope_from_table(table_name)
+        return item
+
+    def _hydrate_memory_row(self, table_name: str, row: dict[str, Any] | None) -> dict[str, Any] | None:
+        item = _deserialize_row(self._memory_row_with_scope(table_name, row))
+        if item is None:
+            return None
+        content_id = item.get("content_id")
+        item["text"] = self.memory_content_store.get_text(self._memory_bucket_for_scope(item["scope"]), content_id) if content_id else ""
+        return item
+
+    def _hydrate_memory_rows(self, table_name: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [item for item in (self._hydrate_memory_row(table_name, row) for row in rows) if item is not None]
+
+    def _list_memory_rows(
+        self,
+        *,
+        scope: str = "all",
+        filters: list[str] | None = None,
+        params: list[Any] | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        sql_filters = filters or ["1 = 1"]
+        sql_params = list(params or [])
+        target_tables = (
+            [(self._memory_table_for_scope(scope), scope)]
+            if scope in MEMORY_TABLE_MAP
+            else [(table_name, table_scope) for table_scope, table_name in MEMORY_TABLE_MAP.items()]
+        )
+        rows: list[dict[str, Any]] = []
+        fetch_size = max(limit + offset, 1)
+        for table_name, _table_scope in target_tables:
+            rows.extend(
+                self._hydrate_memory_rows(
+                    table_name,
+                    self.db.fetch_all(
+                        f"{self._memory_row_sql(table_name)} WHERE {' AND '.join(sql_filters)} ORDER BY updated_at DESC LIMIT ?",
+                        tuple(sql_params + [fetch_size]),
+                    ),
+                )
+            )
+        rows.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
+        return rows[offset : offset + limit]
+
+    def _memory_index_payloads(self, memory_ids: list[str]) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+        if not memory_ids:
+            return {}, {}
+        placeholders = ",".join("?" for _ in memory_ids)
+        index_rows = self.db.fetch_all(
+            f"SELECT * FROM memory_index WHERE record_id IN ({placeholders})",
+            tuple(memory_ids),
+        )
+        semantic_rows = self.db.fetch_all(
+            f"SELECT * FROM semantic_index_cache WHERE collection = 'memory_index' AND record_id IN ({placeholders})",
+            tuple(memory_ids),
+        )
+        return (
+            {str(row["record_id"]): row for row in index_rows},
+            {str(row["record_id"]): row for row in semantic_rows},
+        )
 
     def _resolve_vector_backend_name(self) -> str:
         if self.config.enable_lancedb:
@@ -271,8 +406,11 @@ class AIMemory:
         return {"results": results, "facts": [item["memory"] for item in results]}
 
     def get(self, memory_id: str) -> dict[str, Any] | None:
-        row = self.db.fetch_one("SELECT * FROM memories WHERE id = ?", (memory_id,))
-        return _deserialize_row(row)
+        table_name = self._memory_table_for_id(memory_id)
+        if table_name is None:
+            return None
+        row = self.db.fetch_one(f"{self._memory_row_sql(table_name)} WHERE id = ?", (memory_id,))
+        return self._hydrate_memory_row(table_name, row)
 
     def get_all(
         self,
@@ -328,14 +466,23 @@ class AIMemory:
             sql_filters.append("namespace_key = ?")
             params.append(namespace_filter)
         if scope == str(MemoryScope.SESSION):
-            sql_filters.append("scope = ?")
-            params.append(str(MemoryScope.SESSION))
+            rows = self._list_memory_rows(
+                scope=str(MemoryScope.SESSION),
+                filters=sql_filters,
+                params=params,
+                limit=limit,
+                offset=offset,
+            )
         elif scope == str(MemoryScope.LONG_TERM):
-            sql_filters.append("scope = ?")
-            params.append(str(MemoryScope.LONG_TERM))
-        sql = f"SELECT * FROM memories WHERE {' AND '.join(sql_filters)} ORDER BY updated_at DESC LIMIT ? OFFSET ?"
-        params.extend([limit, offset])
-        rows = _deserialize_rows(self.db.fetch_all(sql, tuple(params)))
+            rows = self._list_memory_rows(
+                scope=str(MemoryScope.LONG_TERM),
+                filters=sql_filters,
+                params=params,
+                limit=limit,
+                offset=offset,
+            )
+        else:
+            rows = self._list_memory_rows(filters=sql_filters, params=params, limit=limit, offset=offset)
         if filters:
             rows = filter_records(rows, filters)
         return {"results": rows, "count": len(rows), "limit": limit, "offset": offset}
@@ -348,19 +495,22 @@ class AIMemory:
         row = self.get(memory_id)
         if row is None:
             raise ValueError(f"Memory `{memory_id}` does not exist.")
+        table_name = self._memory_table_for_id(memory_id)
+        assert table_name is not None
         metadata = merge_metadata(row.get("metadata"), kwargs.pop("metadata", None))
         text = str(kwargs.pop("text", row["text"]))
         summary = str(kwargs.pop("summary", build_summary(split_sentences(text), max_sentences=3, max_chars=200)))
         importance = float(kwargs.pop("importance", row.get("importance", 0.5)))
         status = str(kwargs.pop("status", row.get("status", "active")))
         now = utcnow_iso()
+        self.memory_content_store.put_text(self._memory_bucket_for_scope(row["scope"]), text, key=row["content_id"])
         self.db.execute(
-            """
-            UPDATE memories
-            SET text = ?, summary = ?, importance = ?, status = ?, metadata = ?, updated_at = ?
+            f"""
+            UPDATE {table_name}
+            SET summary = ?, importance = ?, status = ?, metadata = ?, updated_at = ?
             WHERE id = ?
             """,
-            (text, summary, importance, status, json_dumps(metadata), now, memory_id),
+            (summary, importance, status, json_dumps(metadata), now, memory_id),
         )
         self._record_memory_event(memory_id, "UPDATE", {"text": text, "metadata": metadata, "status": status})
         updated = self.get(memory_id)
@@ -376,8 +526,10 @@ class AIMemory:
         row = self.get(memory_id)
         if row is None:
             raise ValueError(f"Memory `{memory_id}` does not exist.")
+        table_name = self._memory_table_for_id(memory_id)
+        assert table_name is not None
         now = utcnow_iso()
-        self.db.execute("UPDATE memories SET status = ?, updated_at = ? WHERE id = ?", ("deleted", now, memory_id))
+        self.db.execute(f"UPDATE {table_name} SET status = ?, updated_at = ? WHERE id = ?", ("deleted", now, memory_id))
         self._delete_memory_index(memory_id)
         self._record_memory_event(memory_id, "DELETE", {"deleted_at": now})
         result = dict(row)
@@ -436,55 +588,54 @@ class AIMemory:
             project_id=kwargs.pop("project_id", None),
             namespace_key=kwargs.pop("namespace_key", None),
         )
-        sql_filters = ["m.status = 'active'"]
+        sql_filters = ["status = 'active'"]
         params: list[Any] = []
         if user_id:
-            sql_filters.append("m.user_id = ?")
+            sql_filters.append("user_id = ?")
             params.append(user_id)
         if owner_agent_id:
-            sql_filters.append("(m.owner_agent_id = ? OR (m.owner_agent_id IS NULL AND m.agent_id = ?))")
+            sql_filters.append("(owner_agent_id = ? OR (owner_agent_id IS NULL AND agent_id = ?))")
             params.extend([owner_agent_id, owner_agent_id])
         if subject_type:
-            sql_filters.append("(m.subject_type = ? OR m.subject_type IS NULL)")
+            sql_filters.append("(subject_type = ? OR subject_type IS NULL)")
             params.append(subject_type)
         if subject_id:
-            sql_filters.append("(m.subject_id = ? OR m.subject_id IS NULL)")
+            sql_filters.append("(subject_id = ? OR subject_id IS NULL)")
             params.append(subject_id)
         if interaction_type:
-            sql_filters.append("(m.interaction_type = ? OR m.interaction_type IS NULL)")
+            sql_filters.append("(interaction_type = ? OR interaction_type IS NULL)")
             params.append(interaction_type)
         if session_id and scope == str(MemoryScope.SESSION):
-            sql_filters.append("m.session_id = ?")
+            sql_filters.append("session_id = ?")
             params.append(session_id)
-        if scope == str(MemoryScope.SESSION):
-            sql_filters.append("m.scope = ?")
-            params.append(str(MemoryScope.SESSION))
-        elif scope == str(MemoryScope.LONG_TERM):
-            sql_filters.append("m.scope = ?")
-            params.append(str(MemoryScope.LONG_TERM))
-        elif session_id:
-            sql_filters.append("(m.scope = ? OR m.session_id = ?)")
-            params.extend([str(MemoryScope.LONG_TERM), session_id])
         if namespace_filter:
-            sql_filters.append("m.namespace_key = ?")
+            sql_filters.append("namespace_key = ?")
             params.append(namespace_filter)
-
-        rows = self.db.fetch_all(
-            f"""
-            SELECT m.*, mi.keywords AS index_keywords, sic.embedding
-            FROM memories m
-            LEFT JOIN memory_index mi ON mi.record_id = m.id
-            LEFT JOIN semantic_index_cache sic ON sic.record_id = m.id
-            WHERE {' AND '.join(sql_filters)}
-            ORDER BY m.updated_at DESC
-            LIMIT ?
-            """,
-            tuple(params + [self.config.memory_policy.search_scan_limit]),
-        )
+        scan_limit = self.config.memory_policy.search_scan_limit
+        if scope == str(MemoryScope.SESSION):
+            rows = self._list_memory_rows(scope=str(MemoryScope.SESSION), filters=sql_filters, params=params, limit=scan_limit)
+        elif scope == str(MemoryScope.LONG_TERM):
+            rows = self._list_memory_rows(scope=str(MemoryScope.LONG_TERM), filters=sql_filters, params=params, limit=scan_limit)
+        else:
+            rows = self._list_memory_rows(filters=sql_filters, params=params, limit=scan_limit)
+            if session_id:
+                rows = [
+                    row
+                    for row in rows
+                    if row.get("scope") == str(MemoryScope.LONG_TERM) or row.get("session_id") == session_id
+                ]
+        index_rows, semantic_rows = self._memory_index_payloads([row["id"] for row in rows])
+        enriched_rows: list[dict[str, Any]] = []
+        for row in rows:
+            enriched = dict(row)
+            record_id = row["id"]
+            enriched["index_keywords"] = index_rows.get(record_id, {}).get("keywords")
+            enriched["embedding"] = semantic_rows.get(record_id, {}).get("embedding")
+            enriched_rows.append(enriched)
         vector_hits = self._vector_hit_map("memory_index", query, limit=max(limit * 4, 24))
         results = self._rank_memory_rows(
             query,
-            rows,
+            enriched_rows,
             half_life_days=self.config.memory_policy.short_term_half_life_days if scope == str(MemoryScope.SESSION) else self.config.memory_policy.long_term_half_life_days,
             threshold=threshold,
             filters=filters,
@@ -1381,22 +1532,18 @@ class AIMemory:
         now = utcnow_iso()
         metadata = dict(kwargs.pop("metadata", {}) or {})
         payload = {"memory": memory, "metadata": metadata}
-        stored = self.object_store.put_text(
-            json_dumps(payload),
-            object_type="archive",
-            suffix=".json",
-            prefix=self._object_store_prefix(memory, "archive"),
-        )
-        object_row = self._persist_object(stored, mime_type="application/json", metadata={"memory_id": memory_id, **self._scope_metadata(memory), **metadata})
         archive_id = make_id("arch")
+        content_id = make_uuid7()
+        self.memory_content_store.put_json("archive", payload, key=content_id)
         summary_text = memory.get("summary") or build_summary(split_sentences(memory["text"]), max_sentences=3, max_chars=240)
         self.db.execute(
             """
-            INSERT INTO archive_units(id, domain, source_id, user_id, owner_agent_id, subject_type, subject_id, interaction_type, namespace_key, source_type, session_id, object_id, summary, metadata, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO archive_memories(id, content_id, domain, source_id, user_id, owner_agent_id, subject_type, subject_id, interaction_type, namespace_key, source_type, session_id, summary, metadata, content_format, created_at, updated_at, last_rehydrated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 archive_id,
+                content_id,
                 "memory",
                 memory_id,
                 memory.get("user_id"),
@@ -1407,10 +1554,12 @@ class AIMemory:
                 memory.get("namespace_key"),
                 "memory",
                 memory.get("session_id"),
-                object_row["id"],
                 summary_text,
                 json_dumps(merge_metadata(metadata, self._scope_metadata(memory))),
+                "application/json",
                 now,
+                now,
+                None,
             ),
         )
         summary_id = make_id("archsum")
@@ -1422,7 +1571,9 @@ class AIMemory:
             """,
             (summary_id, archive_id, summary_text, json_dumps(highlights), json_dumps(metadata), now),
         )
-        self.db.execute("UPDATE memories SET status = ?, archived_at = ?, updated_at = ? WHERE id = ?", ("archived", now, now, memory_id))
+        table_name = self._memory_table_for_id(memory_id)
+        assert table_name is not None
+        self.db.execute(f"UPDATE {table_name} SET status = ?, archived_at = ?, updated_at = ? WHERE id = ?", ("archived", now, now, memory_id))
         self._delete_memory_index(memory_id)
         self._index_archive_summary(
             {
@@ -1479,21 +1630,17 @@ class AIMemory:
             "memories": memories,
             "compression": compression.as_dict(),
         }
-        stored = self.object_store.put_text(
-            json_dumps(payload),
-            object_type="archive",
-            suffix=".json",
-            prefix=self._object_store_prefix(session, "archive"),
-        )
-        object_row = self._persist_object(stored, mime_type="application/json", metadata={"session_id": session_id, **self._scope_metadata(session), **metadata})
         archive_id = make_id("arch")
+        content_id = make_uuid7()
+        self.memory_content_store.put_json("archive", payload, key=content_id)
         self.db.execute(
             """
-            INSERT INTO archive_units(id, domain, source_id, user_id, owner_agent_id, subject_type, subject_id, interaction_type, namespace_key, source_type, session_id, object_id, summary, metadata, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO archive_memories(id, content_id, domain, source_id, user_id, owner_agent_id, subject_type, subject_id, interaction_type, namespace_key, source_type, session_id, summary, metadata, content_format, created_at, updated_at, last_rehydrated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 archive_id,
+                content_id,
                 "session",
                 session_id,
                 session.get("user_id"),
@@ -1504,10 +1651,12 @@ class AIMemory:
                 session.get("namespace_key"),
                 "session",
                 session_id,
-                object_row["id"],
                 compression.summary,
                 json_dumps(merge_metadata(metadata, self._scope_metadata(session))),
+                "application/json",
                 now,
+                now,
+                None,
             ),
         )
         summary_id = make_id("archsum")
@@ -1539,7 +1688,9 @@ class AIMemory:
         self.db.execute("UPDATE sessions SET status = ?, updated_at = ? WHERE id = ?", ("archived", now, session_id))
         for item in memories:
             if item.get("status") == "active":
-                self.db.execute("UPDATE memories SET status = ?, archived_at = ?, updated_at = ? WHERE id = ?", ("archived", now, now, item["id"]))
+                table_name = self._memory_table_for_id(item["id"])
+                if table_name:
+                    self.db.execute(f"UPDATE {table_name} SET status = ?, archived_at = ?, updated_at = ? WHERE id = ?", ("archived", now, now, item["id"]))
                 self._delete_memory_index(item["id"])
         return {
             "archive": self.get_archive_unit(archive_id),
@@ -1547,7 +1698,7 @@ class AIMemory:
         }
 
     def get_archive_unit(self, archive_unit_id: str) -> dict[str, Any] | None:
-        archive = _deserialize_row(self.db.fetch_one("SELECT * FROM archive_units WHERE id = ?", (archive_unit_id,)))
+        archive = _deserialize_row(self.db.fetch_one("SELECT * FROM archive_memories WHERE id = ?", (archive_unit_id,)))
         if archive is None:
             return None
         archive["summaries"] = _deserialize_rows(self.db.fetch_all("SELECT * FROM archive_summaries WHERE archive_unit_id = ? ORDER BY created_at DESC", (archive_unit_id,)), ("highlights", "metadata"))
@@ -1988,19 +2139,18 @@ class AIMemory:
 
     def cleanup_low_value_memories(self, **kwargs) -> dict[str, Any]:
         limit = int(kwargs.pop("limit", 20))
-        rows = _deserialize_rows(
-            self.db.fetch_all(
-                """
-                SELECT m.*, sic.fingerprint
-                FROM memories m
-                LEFT JOIN semantic_index_cache sic ON sic.record_id = m.id
-                WHERE m.scope = ? AND m.status = 'active'
-                ORDER BY m.updated_at ASC
-                LIMIT ?
-                """,
-                (str(MemoryScope.LONG_TERM), max(limit * 4, 80)),
+        rows = list(
+            reversed(
+                self._list_memory_rows(
+                    scope=str(MemoryScope.LONG_TERM),
+                    filters=["status = 'active'"],
+                    limit=max(limit * 4, 80),
+                )
             )
         )
+        _index_rows, semantic_rows = self._memory_index_payloads([row["id"] for row in rows])
+        for row in rows:
+            row["fingerprint"] = semantic_rows.get(row["id"], {}).get("fingerprint")
         archived: list[dict[str, Any]] = []
         seen: list[dict[str, Any]] = []
         for row in rows:
@@ -2030,11 +2180,9 @@ class AIMemory:
 
     def project(self, limit: int | None = None) -> dict[str, Any]:
         projected = {"memory": 0, "knowledge": 0, "skill": 0, "archive": 0}
-        rows = _deserialize_rows(
-            self.db.fetch_all(
-                "SELECT * FROM memories WHERE status = 'active' ORDER BY updated_at DESC LIMIT ?",
-                (limit or self.config.memory_policy.search_scan_limit,),
-            )
+        rows = self._list_memory_rows(
+            filters=["status = 'active'"],
+            limit=(limit or self.config.memory_policy.search_scan_limit),
         )
         for row in rows:
             self._index_memory(row)
@@ -2275,6 +2423,7 @@ class AIMemory:
     def close(self) -> None:
         if self._closed:
             return
+        self.memory_content_store.close()
         self.db.close()
         self._closed = True
 
@@ -2469,18 +2618,22 @@ class AIMemory:
         return {
             "scope": scope,
             "relational_backend": self.config.relational_backend,
+            "content_backend": "lmdb",
+            "lmdb_path": str(self.config.lmdb_path),
             "vector_backend": self._resolve_vector_backend_name(),
             "graph_backend": self._resolve_graph_backend_name(),
             "domains": {
                 "long_term_memory": {
-                    "tables": ["memories", "memory_index"],
+                    "tables": ["long_term_memories", "memory_index"],
+                    "lmdb_bucket": "long_term",
                     "object_prefix": self._object_store_prefix(scope, "memory"),
                     "scope": str(MemoryScope.LONG_TERM),
                     "strategy": "dedupe + semantic distill + hybrid retrieval",
                     "compression_threshold_chars": self.config.memory_policy.long_term_char_threshold,
                 },
                 "short_term_memory": {
-                    "tables": ["conversation_turns", "working_memory_snapshots", "memories"],
+                    "tables": ["conversation_turns", "working_memory_snapshots", "short_term_memories"],
+                    "lmdb_bucket": "short_term",
                     "object_prefix": self._object_store_prefix(scope, "interaction"),
                     "scope": str(MemoryScope.SESSION),
                     "strategy": "session turns + salience compression + promotion",
@@ -2497,7 +2650,8 @@ class AIMemory:
                     "strategy": "versioned procedural memory + semantic search",
                 },
                 "archive": {
-                    "tables": ["archive_units", "archive_summaries", "archive_summary_index"],
+                    "tables": ["archive_memories", "archive_summaries", "archive_summary_index"],
+                    "lmdb_bucket": "archive",
                     "object_prefix": self._object_store_prefix(scope, "archive"),
                     "strategy": "budget compression + low-cost summary retrieval",
                     "compression_threshold_chars": self.config.memory_policy.archive_char_threshold,
@@ -2679,8 +2833,8 @@ class AIMemory:
 
     def _background_texts(self, *, context: MemoryScopeContext, long_term: bool) -> list[str]:
         scope = str(MemoryScope.LONG_TERM if long_term else MemoryScope.SESSION)
-        filters = ["status = 'active'", "scope = ?"]
-        params: list[Any] = [scope]
+        filters = ["status = 'active'"]
+        params: list[Any] = []
         if context.user_id:
             filters.append("user_id = ?")
             params.append(context.user_id)
@@ -2702,9 +2856,11 @@ class AIMemory:
         if not long_term and context.session_id:
             filters.append("session_id = ?")
             params.append(context.session_id)
-        rows = self.db.fetch_all(
-            f"SELECT text FROM memories WHERE {' AND '.join(filters)} ORDER BY updated_at DESC LIMIT ?",
-            tuple(params + [self.config.memory_policy.background_sample_limit]),
+        rows = self._list_memory_rows(
+            scope=scope,
+            filters=filters,
+            params=params,
+            limit=self.config.memory_policy.background_sample_limit,
         )
         return [str(item.get("text") or "") for item in rows if str(item.get("text") or "").strip()]
 
@@ -2756,6 +2912,7 @@ class AIMemory:
         namespace_key = resolved_scope.get("namespace_key")
         metadata = merge_metadata(metadata or {}, self._scope_metadata(resolved_scope))
         now = utcnow_iso()
+        table_name = self._memory_table_for_scope(scope)
         existing, relation = self._find_existing_memory(
             cleaned,
             user_id=user_id,
@@ -2770,9 +2927,11 @@ class AIMemory:
         if existing is not None and relation == "duplicate":
             merged_metadata = merge_metadata(existing.get("metadata"), metadata)
             new_importance = max(float(existing.get("importance", 0.5) or 0.0), float(importance))
+            existing_table = self._memory_table_for_id(existing["id"])
+            assert existing_table is not None
             self.db.execute(
-                """
-                UPDATE memories
+                f"""
+                UPDATE {existing_table}
                 SET importance = ?, namespace_key = ?, metadata = ?, updated_at = ?
                 WHERE id = ?
                 """,
@@ -2789,13 +2948,16 @@ class AIMemory:
             merged_summary = build_summary(split_sentences(merged_text), max_sentences=3, max_chars=220)
             merged_metadata = merge_metadata(existing.get("metadata"), metadata)
             new_importance = max(float(existing.get("importance", 0.5) or 0.0), float(importance))
+            existing_table = self._memory_table_for_id(existing["id"])
+            assert existing_table is not None
+            self.memory_content_store.put_text(self._memory_bucket_for_scope(existing["scope"]), merged_text, key=existing["content_id"])
             self.db.execute(
-                """
-                UPDATE memories
-                SET text = ?, summary = ?, importance = ?, namespace_key = ?, metadata = ?, updated_at = ?
+                f"""
+                UPDATE {existing_table}
+                SET summary = ?, importance = ?, namespace_key = ?, metadata = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (merged_text, merged_summary, new_importance, namespace_key or existing.get("namespace_key"), json_dumps(merged_metadata), now, existing["id"]),
+                (merged_summary, new_importance, namespace_key or existing.get("namespace_key"), json_dumps(merged_metadata), now, existing["id"]),
             )
             self._record_memory_event(existing["id"], "MERGE", {"incoming_text": cleaned})
             merged = self.get(existing["id"])
@@ -2805,14 +2967,17 @@ class AIMemory:
             return merged
 
         memory_id = make_id("mem")
+        content_id = make_uuid7()
         summary = build_summary(split_sentences(cleaned), max_sentences=3, max_chars=220)
+        self.memory_content_store.put_text(self._memory_bucket_for_scope(scope), cleaned, key=content_id)
         self.db.execute(
-            """
-            INSERT INTO memories(id, user_id, agent_id, owner_agent_id, subject_type, subject_id, interaction_type, namespace_key, session_id, run_id, source_session_id, source_run_id, scope, memory_type, text, summary, importance, status, source, metadata, created_at, updated_at, archived_at)
+            f"""
+            INSERT INTO {table_name}(id, content_id, user_id, agent_id, owner_agent_id, subject_type, subject_id, interaction_type, namespace_key, session_id, run_id, source_session_id, source_run_id, memory_type, summary, importance, status, source, metadata, content_format, created_at, updated_at, archived_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 memory_id,
+                content_id,
                 user_id,
                 owner_agent_id,
                 owner_agent_id,
@@ -2824,14 +2989,13 @@ class AIMemory:
                 run_id,
                 session_id,
                 run_id,
-                scope,
                 memory_type,
-                cleaned,
                 summary,
                 float(importance),
                 "active",
                 source,
                 json_dumps(metadata),
+                "text/plain",
                 now,
                 now,
                 None,
@@ -2857,39 +3021,30 @@ class AIMemory:
         session_id: str | None,
         scope: str,
     ) -> tuple[dict[str, Any] | None, str | None]:
-        filters = ["m.user_id = ?", "m.scope = ?", "m.status = 'active'"]
-        params: list[Any] = [user_id, scope]
+        filters = ["user_id = ?", "status = 'active'"]
+        params: list[Any] = [user_id]
         if owner_agent_id:
-            filters.append("(m.owner_agent_id = ? OR (m.owner_agent_id IS NULL AND m.agent_id = ?))")
+            filters.append("(owner_agent_id = ? OR (owner_agent_id IS NULL AND agent_id = ?))")
             params.extend([owner_agent_id, owner_agent_id])
         if subject_type:
-            filters.append("(m.subject_type = ? OR m.subject_type IS NULL)")
+            filters.append("(subject_type = ? OR subject_type IS NULL)")
             params.append(subject_type)
         if subject_id:
-            filters.append("(m.subject_id = ? OR m.subject_id IS NULL)")
+            filters.append("(subject_id = ? OR subject_id IS NULL)")
             params.append(subject_id)
         if interaction_type:
-            filters.append("(m.interaction_type = ? OR m.interaction_type IS NULL)")
+            filters.append("(interaction_type = ? OR interaction_type IS NULL)")
             params.append(interaction_type)
         if namespace_key:
-            filters.append("m.namespace_key = ?")
+            filters.append("namespace_key = ?")
             params.append(namespace_key)
         if scope == str(MemoryScope.SESSION) and session_id:
-            filters.append("m.session_id = ?")
+            filters.append("session_id = ?")
             params.append(session_id)
-        rows = _deserialize_rows(
-            self.db.fetch_all(
-                f"""
-                SELECT m.*, sic.fingerprint
-                FROM memories m
-                LEFT JOIN semantic_index_cache sic ON sic.record_id = m.id
-                WHERE {' AND '.join(filters)}
-                ORDER BY m.updated_at DESC
-                LIMIT ?
-                """,
-                tuple(params + [48]),
-            )
-        )
+        rows = self._list_memory_rows(scope=scope, filters=filters, params=params, limit=48)
+        _index_rows, semantic_rows = self._memory_index_payloads([row["id"] for row in rows])
+        for row in rows:
+            row["fingerprint"] = semantic_rows.get(row["id"], {}).get("fingerprint")
         current_fingerprint = fingerprint(text)
         best_duplicate = None
         best_merge = None
@@ -2935,6 +3090,7 @@ class AIMemory:
 
     def _index_memory(self, memory: dict[str, Any]) -> None:
         keywords = extract_keywords(memory["text"])
+        index_text = " ".join(keywords[:24]) or str(memory.get("summary") or "")[:120]
         self.db.execute(
             """
             INSERT INTO memory_index(record_id, domain, scope, user_id, owner_agent_id, subject_type, subject_id, interaction_type, namespace_key, session_id, text, keywords, score_boost, updated_at, metadata)
@@ -2965,21 +3121,22 @@ class AIMemory:
                 memory.get("interaction_type"),
                 memory.get("namespace_key"),
                 memory.get("session_id"),
-                memory["text"],
+                index_text,
                 json_dumps(keywords),
                 round(float(memory.get("importance", 0.5) or 0.0) * 0.08, 6),
                 memory["updated_at"],
-                json_dumps(memory.get("metadata", {})),
+                json_dumps({"content_id": memory.get("content_id"), **dict(memory.get("metadata", {}))}),
             ),
         )
         self._index_semantic_record(
             collection="memory_index",
             record_id=memory["id"],
             domain="memory",
-            text=memory["text"],
+            text=index_text,
+            semantic_source_text=memory["text"],
             updated_at=memory["updated_at"],
             quality=float(memory.get("importance", 0.5) or 0.0),
-            metadata={"memory_type": memory.get("memory_type"), "scope": memory.get("scope"), **dict(memory.get("metadata", {}))},
+            metadata={"content_id": memory.get("content_id"), "memory_type": memory.get("memory_type"), "scope": memory.get("scope"), **dict(memory.get("metadata", {}))},
             keywords=keywords,
         )
         self.graph_store.upsert_node("memory", memory["id"], memory.get("summary") or memory["text"][:120], memory.get("metadata"))
@@ -3145,15 +3302,17 @@ class AIMemory:
         record_id: str,
         domain: str,
         text: str,
+        semantic_source_text: str | None = None,
         updated_at: str,
         quality: float,
         metadata: dict[str, Any],
         keywords: list[str],
     ) -> None:
+        source_text = semantic_source_text if semantic_source_text is not None else text
         payload = {
             "domain": domain,
-            "embedding": json_dumps([] if not text else self._embedding_for_text(text)),
-            "fingerprint": fingerprint(text),
+            "embedding": json_dumps([] if not source_text else self._embedding_for_text(source_text)),
+            "fingerprint": fingerprint(source_text),
             "quality": quality,
             "updated_at": updated_at,
             "metadata": json_dumps(metadata),
@@ -3193,31 +3352,22 @@ class AIMemory:
 
     def _link_memory_relations(self, memory: dict[str, Any]) -> None:
         self.db.execute("DELETE FROM memory_links WHERE source_memory_id = ?", (memory["id"],))
-        filters = ["m.id != ?", "m.status = 'active'", "m.user_id = ?"]
+        filters = ["id != ?", "status = 'active'", "user_id = ?"]
         params: list[Any] = [memory["id"], memory.get("user_id")]
         owner_agent_id = memory.get("owner_agent_id") or memory.get("agent_id")
         if owner_agent_id:
-            filters.append("(m.owner_agent_id = ? OR (m.owner_agent_id IS NULL AND m.agent_id = ?))")
+            filters.append("(owner_agent_id = ? OR (owner_agent_id IS NULL AND agent_id = ?))")
             params.extend([owner_agent_id, owner_agent_id])
         if memory.get("subject_type"):
-            filters.append("(m.subject_type = ? OR m.subject_type IS NULL)")
+            filters.append("(subject_type = ? OR subject_type IS NULL)")
             params.append(memory.get("subject_type"))
         if memory.get("subject_id"):
-            filters.append("(m.subject_id = ? OR m.subject_id IS NULL)")
+            filters.append("(subject_id = ? OR subject_id IS NULL)")
             params.append(memory.get("subject_id"))
-        candidates = _deserialize_rows(
-            self.db.fetch_all(
-                f"""
-                SELECT m.id, m.text, sic.fingerprint
-                FROM memories m
-                LEFT JOIN semantic_index_cache sic ON sic.record_id = m.id
-                WHERE {' AND '.join(filters)}
-                ORDER BY m.updated_at DESC
-                LIMIT 24
-                """,
-                tuple(params),
-            )
-        )
+        candidates = self._list_memory_rows(scope=memory.get("scope") or "all", filters=filters, params=params, limit=24)
+        _index_rows, semantic_rows = self._memory_index_payloads([row["id"] for row in candidates])
+        for candidate in candidates:
+            candidate["fingerprint"] = semantic_rows.get(candidate["id"], {}).get("fingerprint")
         relation_count = 0
         for candidate in candidates:
             similarity = semantic_similarity(memory.get("text"), candidate.get("text"))

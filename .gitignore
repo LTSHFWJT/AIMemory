@@ -1,3 +1,9 @@
 *.pyc
 *.github
 .gitignore
+mem0/
+openclaw/
+.*
+.tmp-aimemory*/
+selfdoc/
+

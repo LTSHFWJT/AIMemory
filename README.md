@@ -28,7 +28,7 @@
 
 ### 1. 轻量
 
-- 默认存储使用本地 `SQLite`
+- 默认使用本地 `SQLite + LMDB`
 - 对象数据走本地目录
 - 向量与图能力支持插件式增强，不是强依赖
 - 缺少可选依赖时自动回退到本地可运行模式
@@ -70,7 +70,7 @@
 - `aimemory/algorithms/`
   - 压缩、蒸馏、去重、检索重排
 - `aimemory/storage/`
-  - `sqlite`、`lancedb`、`faiss`、`kuzu`、对象存储
+  - `sqlite`、`lmdb`、`lancedb`、`faiss`、`kuzu`、对象存储
 - `aimemory/backends/`
   - 向量 / 图后端注册与默认实现
 - `aimemory/services/`
@@ -125,12 +125,18 @@
 
 | 域 | 主要表 | 主要用途 |
 | --- | --- | --- |
-| 长期记忆 | `memories`、`memory_index` | 存稳定、可复用的信息 |
-| 短期记忆 | `memories`、`conversation_turns`、`working_memory_snapshots` | 存当前窗口的重要上下文 |
+| 长期记忆 | `long_term_memories`、`memory_index` | 元信息落 SQLite，正文落 LMDB |
+| 短期记忆 | `short_term_memories`、`conversation_turns`、`working_memory_snapshots` | 元信息落 SQLite，正文落 LMDB |
 | 知识库 | `documents`、`document_chunks`、`knowledge_chunk_index` | 文档切块与检索 |
 | 技能 | `skills`、`skill_versions`、`skill_index` | 多 Agent 可复用技能 |
-| 归档 | `archive_units`、`archive_summaries`、`archive_summary_index` | 低成本长期保存与再唤起 |
+| 归档 | `archive_memories`、`archive_summaries`、`archive_summary_index` | 元信息落 SQLite，归档内容落 LMDB |
 | 执行记录 | `runs`、`tasks`、`task_steps`、`tool_calls`、`observations` | Agent 执行过程留痕 |
+
+补充说明：
+
+- 短期 / 长期 / 归档正文统一存进 `LMDB`
+- LMDB 的 key 使用 `UUIDv7`
+- SQLite 只保留管理信息、索引信息和与 LMDB 的 `content_id` 关联
 
 ### 多智能体作用域
 
