@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from pathlib import Path
 
 from aimemory import AIMemory
 
@@ -54,6 +55,42 @@ class ScopedMemoryTests(unittest.TestCase):
                 self.assertIn("knowledge", layout["domains"])
                 self.assertIn("archive", layout["domains"])
                 self.assertIn("interaction/", layout["domains"]["short_term_memory"]["object_prefix"])
+                self.assertEqual(layout["sqlite_path"], str(Path(temp_dir).resolve() / "aimemory.db"))
+                self.assertEqual(layout["memory_dir"], str(Path(temp_dir).resolve() / "memory"))
+                self.assertEqual(layout["competency_dir"], str(Path(temp_dir).resolve() / "competency"))
+
+    def test_storage_paths_are_partitioned_by_memory_and_competency(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir).resolve()
+            with AIMemory({"root_dir": temp_dir}) as memory:
+                memory.api.long_term.add(
+                    "长期记忆落在 memory 分区。",
+                    owner_agent_id="agent.alpha",
+                    subject_type="human",
+                    subject_id="user-1",
+                )
+                memory.api.skill.add(
+                    "layout_checker",
+                    "验证能力文件和引用索引落在 competency 分区。",
+                    owner_agent_id="agent.alpha",
+                    subject_type="agent",
+                    subject_id="agent.alpha",
+                    references={"references/layout.md": "competency 分区用于 skill 和 knowledge 文件。"},
+                )
+
+                self.assertEqual(memory.config.sqlite_path, root / "aimemory.db")
+                self.assertEqual(memory.config.memory_path, root / "memory")
+                self.assertEqual(memory.config.competency_path, root / "competency")
+                self.assertEqual(memory.config.lmdb_path, root / "memory" / "lmdb")
+                self.assertEqual(memory.config.object_store_path, root / "competency" / "objects")
+                self.assertEqual(memory.vector_index.memory_path, root / "memory" / "lancedb")
+                self.assertEqual(memory.vector_index.competency_path, root / "competency" / "lancedb")
+                self.assertIn("memory_index", memory.vector_index.memory_store._list_tables())
+                self.assertIn("skill_index", memory.vector_index.competency_store._list_tables())
+                self.assertIn("skill_reference_index", memory.vector_index.competency_store._list_tables())
+                self.assertNotIn("skill_index", memory.vector_index.memory_store._list_tables())
+                self.assertTrue((root / "memory").is_dir())
+                self.assertTrue((root / "competency").is_dir())
 
     def test_mcp_adapter_default_scope_and_context_scope(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
