@@ -293,11 +293,13 @@ await memory.close()
 
 | 方法 | 用途 | 主要参数 |
 | --- | --- | --- |
-| `add(name, description, **kwargs)` | 新增技能 | `name`、`description`、`version`、`prompt_template`、`workflow`、`schema`、`tools`、`tests`、`topics`、`skill_markdown`、`files`、`references`、`scripts`、`assets`、`metadata`、`status`、作用域参数 |
+| `add(name, description, **kwargs)` | 新增技能 | `name`、`description`、`prompt_template`、`workflow`、`schema`、`tools`、`tests`、`topics`、`skill_markdown`、`files`、`references`、`scripts`、`assets`、`metadata`、`status`、作用域参数 |
 | `get(skill_id)` | 获取完整技能内容 | `skill_id` |
 | `list(**kwargs)` | 列出技能 metadata | `owner_agent_id`、`subject_type`、`subject_id`、`status`、`limit`、`offset`、作用域参数 |
-| `search(query, **kwargs)` | 搜索技能 | `query`、`limit`、`threshold`、作用域参数；会联合 skill 主体和 `references/` 文本命中 |
-| `update(skill_id, **kwargs)` | 更新技能并可写入新版本 | `name`、`description`、`version`、`prompt_template`、`workflow`、`schema`、`tools`、`tests`、`topics`、`skill_markdown`、`files`、`references`、`scripts`、`assets`、`metadata`、`status`、作用域参数 |
+| `search(query, **kwargs)` | 搜索技能 | `query`、`limit`、`threshold`、作用域参数；会联合 skill 主体、执行上下文和 `references/` 文本命中 |
+| `search_references(query, **kwargs)` | 搜索 reference 分块 | `query`、`skill_id`、`path_prefix`、`limit`、`threshold`、作用域参数 |
+| `refresh_execution_context(skill_id, **kwargs)` | 刷新 skill 常用执行上下文 | `skill_id`、`path_prefix`、`budget_chars`、`max_sentences`、`max_highlights` |
+| `update(skill_id, **kwargs)` | 更新技能当前快照 | `name`、`description`、`prompt_template`、`workflow`、`schema`、`tools`、`tests`、`topics`、`skill_markdown`、`files`、`references`、`scripts`、`assets`、`metadata`、`status`、作用域参数 |
 | `delete(skill_id)` | 删除技能 | `skill_id` |
 
 `status` 固定枚举值：
@@ -309,9 +311,11 @@ await memory.close()
 
 补充说明：
 
-- skill 现在支持以“本地文件主存储”的方式保存技能包，完整文件清单会随版本返回。
+- skill 现在支持以“本地文件主存储”的方式保存技能包，完整文件清单会随当前快照返回。
+- skill 不再暴露 `versions` 列表；`api.skill.get()` 返回 `current_snapshot` 及其展开后的文件、references、scripts、assets、execution_context。
 - `SKILL.md` 是主入口；如果未显式传入，会根据 `name/description/prompt_template/workflow` 自动生成。
 - `references` 文本会被切块进入辅助检索索引，从而提升 `api.skill.search()` 的召回，但真实文件仍保存在本地对象存储。
+- 系统会基于 `references` 自动生成 `execution_context`，作为常用执行上下文随 `api.skill.get()` 返回。
 
 ## 10. `api.archive`
 

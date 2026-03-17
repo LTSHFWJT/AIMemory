@@ -169,7 +169,8 @@ class AgentDomainAPITest(unittest.TestCase):
             tools=["search", "summarize"],
         )
         self.assertEqual(updated_skill["id"], skill["id"])
-        self.assertGreaterEqual(len(updated_skill["versions"]), 2)
+        self.assertIsNotNone(updated_skill["current_snapshot"])
+        self.assertTrue(updated_skill["execution_context"] == {} or isinstance(updated_skill["execution_context"], dict))
 
         archive = self.memory.api.archive.add(
             summary="归档：平台需要本地优先、多层记忆、插件化数据库能力。",

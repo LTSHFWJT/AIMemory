@@ -121,13 +121,15 @@ class StructuredAPITest(unittest.TestCase):
         )
 
         loaded = self.memory.api.skill.get(skill["id"])
-        latest = loaded["versions"][0]
+        latest = loaded["current_snapshot"]
         file_paths = {item["relative_path"] for item in latest["files"]}
         self.assertIn("SKILL.md", file_paths)
         self.assertIn("references/style-guide.md", file_paths)
         self.assertIn("scripts/render.py", file_paths)
         self.assertIn("assets/template.txt", file_paths)
         self.assertTrue(latest["skill_markdown"].startswith("---"))
+        self.assertTrue(loaded["execution_context"]["summary"])
+        self.assertIn("Execution Context", loaded["execution_context_text"])
         self.assertEqual(
             next(item["content"] for item in latest["references"] if item["relative_path"] == "references/style-guide.md"),
             "标题遵循 RFC 风格，示例必须给出输入输出。",
@@ -182,12 +184,13 @@ class StructuredAPITest(unittest.TestCase):
             references={"references/risk.md": "发布前必须补充回滚步骤。"},
         )
 
-        latest = updated["versions"][0]
+        latest = updated["current_snapshot"]
         file_paths = {item["relative_path"] for item in latest["files"]}
         self.assertIn("references/base.md", file_paths)
         self.assertIn("references/risk.md", file_paths)
         self.assertIn("scripts/check.py", file_paths)
-        self.assertGreaterEqual(len(updated["versions"]), 2)
+        self.assertIsNotNone(updated["current_snapshot"])
+        self.assertTrue(updated["execution_context"]["summary"])
 
         search = self.memory.api.skill.search(
             "回滚步骤 风险提示",
@@ -278,6 +281,7 @@ class StructuredAPITest(unittest.TestCase):
         self.assertTrue(compressed["highlights"])
         self.assertTrue(compressed["steps"])
         self.assertTrue(compressed["constraints"])
+        self.assertTrue(compressed["risks"])
         self.assertTrue(compressed["selected_unit_ids"])
 
         document = self.memory.api.knowledge.add(
@@ -328,6 +332,59 @@ class StructuredAPITest(unittest.TestCase):
         self.assertTrue(skill_compression["summary"])
         self.assertTrue(skill_compression["steps"])
         self.assertTrue(skill_compression["constraints"])
+        refreshed = self.memory.api.skill.refresh_execution_context(skill["id"])
+        self.assertTrue(refreshed["persisted"])
+        loaded_skill = self.memory.api.skill.get(skill["id"])
+        self.assertTrue(loaded_skill["execution_context"]["summary"])
+
+    def test_long_text_compression_keeps_sequence_and_section_context(self) -> None:
+        compressed = self.memory.api.recall.compress_text(
+            """
+            # 背景
+            系统需要在今晚完成发布，涉及数据库迁移、接口验证和监控检查。
+
+            # 步骤
+            1. 先执行 precheck，确认配置、凭证、磁盘空间和 migration plan 正确。
+            2. 再执行 deploy --batch=bluegreen，并记录版本号 v4.8.2。
+            3. 发布完成后执行 smoke test，并观察 5 分钟错误率。
+
+            # 约束
+            - CPU 使用率不得超过 70%
+            - 错误率不得超过 1%
+            - 发布时间窗口限制在 30 分钟内
+
+            # 风险与回滚
+            如果 smoke test 失败，必须立即回滚数据库和应用快照。
+            回滚后需要再次验证订单接口、支付接口和登录链路。
+            注意：不要在高峰流量期间执行回滚。
+            """,
+            query="发布 回滚 错误率 版本 约束",
+            domain_hint="skill_reference",
+            budget_chars=240,
+        )
+        joined = "\n".join(compressed["highlights"])
+        self.assertIn("precheck", joined)
+        self.assertTrue(any(item.startswith("[步骤]") or item.startswith("[约束]") or item.startswith("[风险与回滚]") for item in compressed["highlights"]))
+        self.assertTrue(any("回滚" in item for item in compressed["risks"]))
+
+    def test_same_skill_name_is_reusable_across_agents(self) -> None:
+        first = self.memory.api.skill.add(
+            "context_compactor",
+            "agent alpha 的压缩技能。",
+            owner_agent_id="agent.alpha",
+            references={"references/alpha.md": "alpha agent 偏好保留步骤和约束。"},
+        )
+        second = self.memory.api.skill.add(
+            "context_compactor",
+            "agent beta 的压缩技能。",
+            owner_agent_id="agent.beta",
+            references={"references/beta.md": "beta agent 偏好保留风险和回退。"},
+        )
+        self.assertNotEqual(first["id"], second["id"])
+        alpha_results = self.memory.api.skill.list(owner_agent_id="agent.alpha")["results"]
+        beta_results = self.memory.api.skill.list(owner_agent_id="agent.beta")["results"]
+        self.assertEqual(alpha_results[0]["id"], first["id"])
+        self.assertEqual(beta_results[0]["id"], second["id"])
 
 
 class AsyncStructuredAPITest(unittest.TestCase):

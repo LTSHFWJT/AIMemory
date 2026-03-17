@@ -23,7 +23,7 @@ Service / Worker 更适合：
 | `MemoryService` | 记忆写入、记忆维护、晋升、清理规划 |
 | `InteractionService` | 会话、轮次、变量、工具状态、上下文压缩 |
 | `KnowledgeService` | 知识源、文档写入、文档读取 |
-| `SkillService` | 技能注册、版本激活、技能查询 |
+| `SkillService` | 技能注册、当前快照维护、技能查询 |
 | `ArchiveService` | 记忆 / 会话归档与恢复 |
 | `ExecutionService` | run / task / step / tool call / observation |
 | `RetrievalService` | 各域搜索与统一召回 |
@@ -116,7 +116,6 @@ Service / Worker 更适合：
 | `register(name, description, ...)` | 注册技能 |
 | `get_skill(skill_id)` | 获取技能 |
 | `list_skills(status=None, owner_agent_id=None)` | 列出技能 |
-| `activate_version(skill_id, version)` | 激活指定版本 |
 
 ### 技能适合承载的内容
 
@@ -125,6 +124,11 @@ Service / Worker 更适合：
 - 工具绑定
 - 测试样例
 - capability 标签
+
+补充说明：
+
+- `SkillService` 不再提供版本激活语义；一个 skill 在任意时刻只维护一个 `current_snapshot`
+- 调用 `register(...)` 更新同名 skill 时，会直接替换当前快照
 
 ## 6. `ArchiveService`
 

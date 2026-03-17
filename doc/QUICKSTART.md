@@ -255,6 +255,8 @@ result = memory.api.skill.search(
     subject_type="agent",
     subject_id="agent.assistant",
 )
+
+execution_context = memory.api.skill.refresh_execution_context(skill["id"])
 ```
 
 技能适合保存：
