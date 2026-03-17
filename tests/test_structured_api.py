@@ -366,6 +366,28 @@ class StructuredAPITest(unittest.TestCase):
         self.assertIn("precheck", joined)
         self.assertTrue(any(item.startswith("[步骤]") or item.startswith("[约束]") or item.startswith("[风险与回滚]") for item in compressed["highlights"]))
         self.assertTrue(any("回滚" in item for item in compressed["risks"]))
+        self.assertTrue(compressed["steps"][0].startswith("先执行 precheck"))
+
+    def test_multiline_list_item_is_kept_as_single_step_and_constraints_are_detected(self) -> None:
+        compressed = self.memory.api.recall.compress_text(
+            """
+            # Steps
+            1. Prepare release manifest
+               include rollback ids and migration checksum
+            2. Deploy app
+            3. Verify checkout flow
+
+            # Constraints
+            - CPU <= 70%
+            - error rate <= 1%
+            """,
+            query="deploy rollback constraints",
+            domain_hint="skill_reference",
+            budget_chars=160,
+        )
+        self.assertTrue(any("include rollback ids and migration checksum" in item for item in compressed["steps"]))
+        self.assertTrue(any("CPU <= 70%" in item for item in compressed["constraints"]))
+        self.assertFalse(any(item == "[Steps] include rollback ids and migration checksum" for item in compressed["highlights"]))
 
     def test_same_skill_name_is_reusable_across_agents(self) -> None:
         first = self.memory.api.skill.add(
