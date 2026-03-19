@@ -6,4 +6,5 @@ openclaw/
 .*
 .tmp-aimemory*/
 selfdoc/
-
+openclaw-viking/
+memory-lancedb-pro/
