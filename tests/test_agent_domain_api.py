@@ -59,13 +59,20 @@ class AgentDomainAPITest(unittest.TestCase):
         self.assertEqual(agent_list["count"], 1)
         self.assertEqual(human_list["results"][0]["id"], human["id"])
         self.assertEqual(agent_list["results"][0]["id"], agent["id"])
-        long_term_meta = self.memory.db.fetch_one("SELECT bundle_id, content_id FROM long_term_memories WHERE id = ?", (human["id"],))
+        long_term_meta = self.memory.db.fetch_one(
+            "SELECT bundle_id, content_id, text, text_hash, storage_policy FROM long_term_memories WHERE id = ?",
+            (human["id"],),
+        )
         self.assertIsNotNone(long_term_meta)
         self.assertRegex(long_term_meta["content_id"], r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
         self.assertRegex(long_term_meta["bundle_id"], r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
-        long_term_bundle = self.memory.memory_content_store.get_json("long_term", long_term_meta["bundle_id"], {})
+        self.assertEqual(long_term_meta["text"], "用户偏好简洁分点回答，并且希望所有输出都尽量先给结论。")
+        self.assertEqual(long_term_meta["storage_policy"], "inline")
+        self.assertTrue(long_term_meta["text_hash"])
+        long_term_bundle = self.memory._get_memory_bundle("long_term", long_term_meta["bundle_id"])
         long_term_item = next(item for item in long_term_bundle.get("items", []) if item.get("content_id") == long_term_meta["content_id"])
-        self.assertEqual(long_term_item["text"], "用户偏好简洁分点回答，并且希望所有输出都尽量先给结论。")
+        self.assertEqual(long_term_item["summary_l1"], human["summary"])
+        self.assertNotIn("text", long_term_item)
         self.assertFalse(human["compression"]["triggered"])
         memory_index_row = self.memory.db.fetch_one("SELECT text FROM memory_index WHERE record_id = ?", (human["id"],))
         self.assertIsNotNone(memory_index_row)
@@ -99,13 +106,20 @@ class AgentDomainAPITest(unittest.TestCase):
             session_id=session["id"],
         )
         self.assertTrue(short_term["id"])
-        short_term_meta = self.memory.db.fetch_one("SELECT bundle_id, content_id FROM short_term_memories WHERE id = ?", (short_term["id"],))
+        short_term_meta = self.memory.db.fetch_one(
+            "SELECT bundle_id, content_id, text, text_hash, storage_policy FROM short_term_memories WHERE id = ?",
+            (short_term["id"],),
+        )
         self.assertIsNotNone(short_term_meta)
         self.assertRegex(short_term_meta["content_id"], r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
         self.assertRegex(short_term_meta["bundle_id"], r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
-        short_term_bundle = self.memory.memory_content_store.get_json("short_term", short_term_meta["bundle_id"], {})
+        self.assertEqual(short_term_meta["text"], "这轮会话需要完成架构评审，并且要保留插件化与轻量化约束。")
+        self.assertEqual(short_term_meta["storage_policy"], "inline")
+        self.assertTrue(short_term_meta["text_hash"])
+        short_term_bundle = self.memory._get_memory_bundle("short_term", short_term_meta["bundle_id"])
         short_term_item = next(item for item in short_term_bundle.get("items", []) if item.get("content_id") == short_term_meta["content_id"])
-        self.assertEqual(short_term_item["text"], "这轮会话需要完成架构评审，并且要保留插件化与轻量化约束。")
+        self.assertEqual(short_term_item["summary_l1"], short_term["summary"])
+        self.assertNotIn("text", short_term_item)
         self.assertTrue(short_term["compression"]["triggered"])
         self.assertIn("memory_overflow_warning", short_term)
         compressed = self.memory.api.short_term.compress(
@@ -135,6 +149,9 @@ class AgentDomainAPITest(unittest.TestCase):
         )
         self.assertTrue(document["id"])
         self.assertTrue(global_document["id"])
+        self.assertEqual(document["storage_policy"], "large_only")
+        self.assertEqual(document["inline_text"], "AIMemory 面向多主体、多智能体协同平台，提供本地优先记忆存储。")
+        self.assertEqual(document["text"], document["inline_text"])
 
         listed_docs = self.memory.api.knowledge.list(
             owner_agent_id="agent.alpha",
@@ -179,11 +196,15 @@ class AgentDomainAPITest(unittest.TestCase):
             subject_id="user-1",
         )
         self.assertTrue(archive["id"])
-        archive_meta = self.memory.db.fetch_one("SELECT bundle_id, content_id FROM archive_memories WHERE id = ?", (archive["id"],))
+        archive_meta = self.memory.db.fetch_one(
+            "SELECT bundle_id, content_id, storage_policy FROM archive_memories WHERE id = ?",
+            (archive["id"],),
+        )
         self.assertIsNotNone(archive_meta)
         self.assertRegex(archive_meta["content_id"], r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
         self.assertRegex(archive_meta["bundle_id"], r"^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
-        archive_bundle = self.memory.memory_content_store.get_json("archive", archive_meta["bundle_id"], {})
+        self.assertEqual(archive_meta["storage_policy"], "cold_only")
+        archive_bundle = self.memory._get_memory_bundle("archive", archive_meta["bundle_id"])
         archive_item = next(item for item in archive_bundle.get("items", []) if item.get("content_id") == archive_meta["content_id"])
         self.assertEqual(archive_item["summary"], "归档：平台需要本地优先、多层记忆、插件化数据库能力。")
         self.assertIsNone(

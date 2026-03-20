@@ -1,303 +1,258 @@
 # AIMemory Facade API
 
-本文档只保留 `AIMemory` 当前推荐的 Facade 用法。
+这份文档只讲 façade 层，也就是协同平台最应该直接接入的部分。
 
-如果你只关心怎么接入，请看这份；如果你需要完整参数与返回结构，请看 `doc/API_REFERENCE.md`。
+结论先说：
 
-涉及固定枚举值与推荐约定值时，以 `doc/API_REFERENCE.md` 中的“作用域参数 / 严格枚举值 / 推荐约定值”章节为准。
+- 平台主接入面应该是 `AIMemory` / `ScopedAIMemory` / `AsyncAIMemory`
+- 高级上下文压缩应该通过平台 LLM 插件接入
+- MCP 是可选工具暴露层，不是平台内部压缩总线
 
-## 1. 推荐接口面
+## 1. 推荐调用路径
 
-当前只推荐使用以下入口：
+推荐顺序：
 
-- `AIMemory.api.*`
-- `ScopedAIMemory.api.*`
-- `AsyncAIMemory.api.*`
-
-统一分组如下：
-
-- `api.long_term`
-- `api.short_term`
-- `api.knowledge`
-- `api.skill`
-- `api.archive`
-- `api.session`
-- `api.recall`
-- `api.execution`
+1. `memory.api.*`
+2. `memory.events.*`
+3. `scoped.api.*`
+4. `async_memory.api.*`
+5. `AIMemoryMCPAdapter` 仅在需要工具面时使用
 
 ## 2. `AIMemory`
 
-### 2.1 初始化
+### 初始化
 
 ```python
 from aimemory import AIMemory
 
+memory = AIMemory({"root_dir": ".aimemory"})
+```
+
+也支持显式注入：
+
+```python
 memory = AIMemory(
-    {
-        "root_dir": ".aimemory",
-        "workspace_id": "ws.alpha",
-        "team_id": "team.memory",
-    }
+    {"root_dir": ".aimemory"},
+    platform_llm=my_llm_adapter,
+    platform_events=my_event_adapter,
 )
 ```
 
-最常用配置：
+但当前更推荐插件注册 + 配置解析。
 
-| 配置项 | 说明 |
+### 根对象常用方法
+
+| 方法 / 属性 | 说明 |
 | --- | --- |
-| `root_dir` | 本地数据根目录 |
-| `workspace_id` / `team_id` / `project_id` | 团队作用域默认值 |
-| `index_backend` | 向量后端 |
-| `graph_backend` | 图后端 |
-| `providers` | LiteLLM 风格配置 |
-| `embeddings` | 嵌入配置 |
-| `memory_policy` | 压缩、检索、去重策略 |
+| `api` | 结构化 API 根入口 |
+| `events` | 平台事件适配器 |
+| `scoped(**scope_kwargs)` | 创建 `ScopedAIMemory` |
+| `bind_platform_llm(adapter=None, plugin_name=None, settings=None)` | 绑定平台 LLM |
+| `describe_capabilities()` | 返回能力矩阵 |
+| `storage_layout(**scope_kwargs)` | 返回当前作用域下的存储布局 |
+| `litellm_config()` | 返回 provider 配置 |
+| `compress_text(...)` | 本地文本压缩 |
+| `compress_document(...)` | 单文档本地压缩 |
+| `create_mcp_adapter(scope=None)` | 创建可选 MCP adapter |
+| `close()` | 关闭资源 |
 
-### 2.2 最小示例
+## 3. `ScopedAIMemory`
 
-```python
-from aimemory import AIMemory
-
-with AIMemory({"root_dir": ".aimemory-demo"}) as memory:
-    session = memory.api.session.create(
-        user_id="user-1",
-        owner_agent_id="agent.assistant",
-        subject_type="human",
-        subject_id="user-1",
-        interaction_type="human_agent",
-        title="demo",
-    )
-
-    memory.api.session.append(
-        session["id"],
-        "user",
-        "我喜欢简洁、分点、低 token 的回答。",
-    )
-
-    memory.api.long_term.add(
-        "用户偏好简洁分点输出。",
-        owner_agent_id="agent.assistant",
-        subject_type="human",
-        subject_id="user-1",
-        interaction_type="human_agent",
-        memory_type="preference",
-        importance=0.9,
-    )
-
-    memory.api.knowledge.add(
-        "平台规则",
-        "先查知识库，再决定是否访问外部资源。",
-        global_scope=True,
-    )
-
-    result = memory.api.recall.query(
-        "用户喜欢什么输出风格？",
-        owner_agent_id="agent.assistant",
-        subject_type="human",
-        subject_id="user-1",
-        session_id=session["id"],
-        domains=["memory", "knowledge"],
-        limit=8,
-    )
-
-    print(result["results"])
-```
-
-### 2.3 根对象常用方法
-
-| 方法 | 说明 |
-| --- | --- |
-| `api` | 当前唯一推荐调用入口 |
-| `scoped(**scope_kwargs)` | 创建固定作用域句柄 |
-| `create_mcp_adapter(scope=None)` | 创建 MCP 适配器 |
-| `storage_layout(**scope_kwargs)` | 查看当前存储布局 |
-| `describe_capabilities()` | 查看能力清单 |
-| `litellm_config()` | 导出 LiteLLM 风格配置 |
-| `register_domain_compressor(domain, compressor)` | 注册压缩器 |
-| `project(limit=None)` | 重建索引 |
-| `close()` | 关闭实例 |
-
-## 3. 分组 API
-
-### 3.1 记忆
-
-| 分组 | 适用场景 |
-| --- | --- |
-| `api.long_term` | 跨会话稳定记忆 |
-| `api.short_term` | 会话内短期上下文 |
-
-常用方法：
-
-- `add()`
-- `get()`
-- `list()`
-- `search()`
-- `update()`
-- `delete()`
-- `compress()`
-
-推荐原则：
-
-- 长期记忆写稳定偏好、事实、长期经验
-- 短期记忆写当前会话中的关键上下文
-
-### 3.2 知识、技能、归档
-
-| 分组 | 适用场景 |
-| --- | --- |
-| `api.knowledge` | 先查证据再回答 |
-| `api.skill` | 开始执行前先查已有技能 |
-| `api.archive` | 低频但长期保留的冷数据 |
-
-这三个分组统一使用以下方法形态：
-
-- `add()`
-- `get()`
-- `list()`
-- `search()`
-- `update()`
-- `delete()`
-
-其中 `api.archive` 额外提供：
-
-- `compress()`
-
-### 3.3 会话
-
-`api.session` 用于管理对话上下文与会话治理。
-
-常用方法：
-
-- `create()`
-- `get()`
-- `append()`
-- `compress()`
-- `promote()`
-- `health()`
-- `prune()`
-- `archive()`
-- `govern()`
-
-推荐做法：
-
-- 所有对话消息先写 `api.session.append()`
-- 会话变长后调用 `api.session.compress()`
-- 会话结束后根据需要调用 `api.session.promote()` 或 `api.session.archive()`
-
-### 3.4 统一召回
-
-`api.recall.query()` 是当前最推荐的统一读接口。
-
-适合：
-
-- 同时查记忆、知识、技能、归档
-- 让 Agent 在执行前先拼好证据上下文
-- 避免业务层自己做多次检索再手动合并
-
-可选 `domains`：
-
-- `memory`
-- `interaction`
-- `knowledge`
-- `skill`
-- `archive`
-- `execution`
-
-`api.recall.explain()` 用于查看召回策略和路由解释。
-
-### 3.5 执行记录
-
-`api.execution` 目前主要提供：
-
-- `start_run()`
-- `search()`
-
-适合保存 run 级目标与后续回查。
-
-## 4. `ScopedAIMemory`
-
-当你在固定 scope 下频繁调用时，优先使用 `scoped()`：
+当同一个 agent、团队或项目会不断复用同一组 scope 时，用 `scoped(...)` 最合适。
 
 ```python
 scoped = memory.scoped(
     workspace_id="ws.alpha",
-    team_id="team.memory",
+    team_id="team.alpha",
     owner_agent_id="agent.planner",
     subject_type="agent",
     subject_id="agent.executor",
     interaction_type="agent_agent",
 )
-
-scoped.api.long_term.add("executor 擅长把长计划压缩成可执行步骤。")
-result = scoped.api.recall.query("executor 擅长什么", domains=["memory", "skill"])
 ```
 
-`ScopedAIMemory` 公开能力：
+常用方法：
 
 | 方法 | 说明 |
 | --- | --- |
-| `api` | 自动携带默认 scope |
-| `using(**scope_overrides)` | 基于当前 scope 派生新 scope |
-| `scope_dict()` | 返回当前 scope |
-| `storage_layout()` | 查看当前 scope 的存储布局 |
+| `api` | 自动继承 scope 的结构化 API |
+| `using(**scope_overrides)` | 派生子 scope |
+| `scope_dict()` | 查看当前 scope |
+| `storage_layout()` | 查看 scoped 布局 |
 | `create_mcp_adapter()` | 创建带默认 scope 的 MCP adapter |
 
-## 5. `AsyncAIMemory`
+## 4. `AsyncAIMemory`
 
-异步场景直接使用：
+异步 façade 只做线程包装，公共语义与同步版一致。
 
 ```python
 from aimemory import AsyncAIMemory
 
 memory = AsyncAIMemory({"root_dir": ".aimemory-async"})
-await memory.api.long_term.add("异步入口也使用同一组 Facade API。")
+await memory.api.short_term.add("异步 runtime 也复用同一套 façade。")
 await memory.close()
 ```
 
-推荐场景：
+适合：
 
-- 异步 Web 服务
-- 异步 Agent Runtime
-- 统一用 `await` 风格组织接入层
+- async Web 服务
+- async agent runtime
+- 统一 `await` 风格的 orchestration 层
 
-## 6. MCP Adapter
+## 5. façade 层的高价值能力
 
-如果要把能力暴露给上层 Agent，用：
+### `api.session.*`
+
+适合：
+
+- 写 turn
+- 生成 snapshot
+- 晋升 session memory
+- 运行治理流程
+
+说明：
+
+- `append(...)` 会把 turn、记忆抽取和 session 压缩串起来
+- session 压缩使用本地算法，不依赖平台 LLM
+
+### `api.recall.*`
+
+适合：
+
+- 多域统一召回
+- recall routing
+- explanation / debug
+
+### `api.context.build(...)`
+
+适合：
+
+- 构建发给当前 agent 的最小 prompt context
+- 统一引用 memory / interaction / knowledge / archive / execution / handoff / reflection
+- 持久化为 `context_artifacts`
+
+### `api.handoff.build(...)`
+
+适合：
+
+- planner -> executor
+- agent -> agent 切换
+- 保留任务摘要、约束、开放事项、关联 source refs
+
+### `api.reflection.session(...)` / `api.reflection.run(...)`
+
+适合：
+
+- 会话后经验沉淀
+- run 级过程复盘
+- 把结果写成可检索的 reflection memories
+
+### `api.acl.*`
+
+适合：
+
+- 跨 agent / 团队授权
+- namespace 级资源读写管理
+
+## 6. 平台 LLM 插件接入
+
+### 注册
 
 ```python
-adapter = memory.create_mcp_adapter(
-    scope={
-        "workspace_id": "ws.alpha",
-        "team_id": "team.memory",
-        "owner_agent_id": "agent.planner",
+from aimemory import register_platform_llm_plugin
+
+register_platform_llm_plugin("platform.llm", factory)
+```
+
+`factory(config)` 需要返回一个实现了下列接口的对象：
+
+```python
+class PlatformLLM:
+    provider = "platform"
+    model = "compressor"
+
+    def compress(self, *, task_type, records, budget_chars, scope, metadata=None):
+        ...
+```
+
+### 配置驱动
+
+```python
+memory = AIMemory(
+    {
+        "root_dir": ".aimemory",
+        "platform_llm_plugin": {
+            "name": "platform.llm",
+            "endpoint": "https://platform.internal/llm",
+        },
     }
 )
 ```
 
-常见工具：
+### 运行时绑定
 
-- `recall_query`
-- `long_term_memory_*`
-- `short_term_memory_*`
-- `knowledge_document_*`
-- `skill_*`
-- `archive_memory_*`
-- `session_*`
-- `aimemory_manifest`
+```python
+memory.bind_platform_llm(
+    plugin_name="platform.llm",
+    settings={"endpoint": "https://platform.internal/llm"},
+)
+```
 
-## 7. 推荐接入顺序
+### 实际生效位置
 
-1. 初始化 `AIMemory`
-2. 如有固定作用域，先 `memory.scoped(...)`
-3. 先查 `api.skill.search()` / `api.knowledge.search()`
-4. 用 `api.session.*` 管理会话
-5. 用 `api.long_term` / `api.short_term` 管理记忆
-6. 用 `api.recall.query()` 做统一召回
-7. 用 `api.archive` 或 `api.session.archive()` 做冷存储
-8. 需要工具化时接 `create_mcp_adapter()`
+平台 LLM 只在高级语义压缩链路里生效：
 
-## 8. 更多细节
+- `api.context.build(...)`
+- `api.handoff.build(...)`
+- `api.reflection.session(...)`
+- `api.reflection.run(...)`
 
-完整参数、返回结构、字段范围说明，请看：
+如果平台 LLM 抛异常，系统会回退到本地压缩并把 job 标成 `degraded`。
 
-- `doc/API_REFERENCE.md`
+## 7. `events` façade
+
+默认 `memory.events` 已经是一层平台编排 façade：
+
+| 方法 | 典型用途 |
+| --- | --- |
+| `on_turn_end(...)` | turn 结束后自动压缩、召回、生成 context |
+| `on_agent_end(...)` | agent 结束后自动 context + reflection |
+| `on_handoff(...)` | 自动构建 handoff 和可选 context |
+| `on_session_close(...)` | 关闭会话时压缩、反思、清理 |
+
+这层非常适合挂到协同平台的生命周期事件上。
+
+## 8. `describe_capabilities()`
+
+适合平台启动时做自检。当前会返回：
+
+- 当前向量 / 图后端
+- 当前 embedding 配置
+- 当前平台插件列表与活跃 provider
+- 当前 `memory_policy`
+- 可选 MCP tool 列表
+
+## 9. 什么时候不要直接下沉到 service
+
+以下场景不建议绕过 façade：
+
+- 你需要 ACL
+- 你需要 scope 自动补全
+- 你需要 context / handoff / reflection 持久化
+- 你需要平台事件编排
+- 你需要平台 LLM 压缩回退逻辑
+
+只有在做内核二开、批处理 worker 或替换算法组件时，才建议直接进入 service / worker 层。
+
+## 10. MCP 的定位
+
+`create_mcp_adapter()` 仍然保留，但它的定位是：
+
+- 让外部 agent 通过工具协议访问 `aimemory`
+- 暴露 tool schema 和 manifest
+
+它不是：
+
+- 平台 LLM 注册机制
+- 平台内部压缩调度机制
+- 多智能体 runtime 的唯一接入方式

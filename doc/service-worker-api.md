@@ -1,324 +1,340 @@
 # Service & Worker API
 
-本文档面向高级集成者，介绍 `aimemory/services/*` 与 `aimemory/workers/*`。
+这份文档面向内核二开者，说明 `aimemory/services/*`、`aimemory/workers/*` 和 `memory_intelligence/*` 的职责边界。
 
-如果你只是业务侧接入，优先使用：
+先给结论：
 
-- `AIMemory`
-- `ScopedAIMemory`
-- `AIMemoryMCPAdapter`
+- 业务接入方优先用 façade：`AIMemory.api.*` 和 `memory.events.*`
+- service / worker 更适合批处理、内核扩展、定制算法链路
+- 平台 LLM 压缩仍然建议从 façade 进入，不建议在 service 层直接硬编码平台调用
 
-Service / Worker 更适合：
+## 1. 分层关系
 
-- 自定义 runtime 编排
-- 更细粒度控制各个存储域
-- 本地后台任务治理
+```text
+Facade
+  -> scope merge
+  -> ACL
+  -> multi-domain orchestration
+  -> platform event hooks
+  -> platform LLM compression fallback
 
-## 1. Service 层总览
+Service
+  -> domain-level operations
+  -> closer to tables / projection queue
+  -> reusable building blocks
 
-当前 Service 层包含：
+Worker
+  -> scheduled automation
+  -> compaction / promotion / cleaning / governance / projection
 
-| 服务 | 作用 |
-| --- | --- |
-| `MemoryService` | 记忆写入、记忆维护、晋升、清理规划 |
-| `InteractionService` | 会话、轮次、变量、工具状态、上下文压缩 |
-| `KnowledgeService` | 知识源、文档写入、文档读取 |
-| `SkillService` | 技能注册、当前快照维护、技能查询 |
-| `ArchiveService` | 记忆 / 会话归档与恢复 |
-| `ExecutionService` | run / task / step / tool call / observation |
-| `RetrievalService` | 各域搜索与统一召回 |
-| `ProjectionService` | 延迟投影与索引队列 |
+Memory Intelligence
+  -> candidate extraction
+  -> neighbor recall
+  -> add / update / supersede / merge / delete planning
+```
+
+## 2. `ServiceBase`
+
+所有 service 都以 `ServiceBase` 为基类。
+
+构造参数：
+
+- `db`
+- `projection`
+- `config`
+- `object_store=None`
+
+基础能力：
+
+- 行反序列化
+- 对象存储落库辅助
+- 惰性 `_kernel()`，必要时按同一份 `config` 创建内部 `AIMemory`
 
 说明：
 
-- Service 层更接近领域能力
-- 与最新团队 scope 能力相比，Facade 层封装更完整
-- 如果你是平台方，优先建议从 Facade 往下调，而不是直接拼 Service
+- service 不是默认导出的公共对象
+- 你需要自己实例化和编排
 
-## 2. `MemoryService`
+## 3. `MemoryService`
 
-### 核心方法
+文件：`aimemory/services/memory_service.py`
 
-| 方法 | 说明 |
+公开方法：
+
+| 方法 | 作用 |
 | --- | --- |
-| `set_intelligence_pipeline(pipeline)` | 注入自定义智能提取管线 |
-| `add(messages)` | 批量抽取并写入记忆 |
-| `remember(text)` | 写单条记忆 |
-| `get(memory_id)` | 获取单条记忆 |
-| `get_all(...)` | 列出记忆 |
-| `promote_session_memories(session_id, ...)` | 从会话中晋升长期记忆 |
-| `plan_low_value_cleanup()` | 规划低价值记忆清理 |
-| `update(memory_id, ...)` | 更新记忆 |
-| `delete(memory_id)` | 删除记忆 |
-| `delete_by_query(query)` | 按查询删除 |
-| `history(memory_id)` | 查看事件历史 |
-| `build_scope_context()` | 构建作用域上下文 |
+| `set_intelligence_pipeline(pipeline)` | 替换记忆抽取管线 |
+| `add(messages, **kwargs)` | 批量抽取并写入记忆 |
+| `remember(text, **kwargs)` | 直接写单条记忆 |
+| `get(memory_id)` | 获取记忆 |
+| `get_all(...)` | 列表 |
+| `promote_session_memories(session_id, ...)` | 会话记忆晋升 |
+| `plan_low_value_cleanup(...)` | 规划低价值清理 |
+| `update(memory_id, ...)` | 更新 |
+| `supersede(memory_id, ...)` | 版本替代 |
+| `link(memory_id, target_memory_ids, ...)` | 建立关系 |
+| `delete(memory_id)` | 删除 |
+| `delete_by_query(query, ...)` | 按查询删除 |
+| `history(memory_id)` | 审计历史 |
+| `build_scope_context(...)` | 构建 `MemoryScopeContext` |
 
-### 适合场景
+适合场景：
 
-- 想替换默认提取管线
-- 想做更细粒度的记忆维护
-- 想单独控制晋升和清理策略
+- 定制抽取 / 规划算法
+- 批量记忆维护
+- 离线清理与版本修复
 
-## 3. `InteractionService`
+## 4. `InteractionService`
 
-### 核心方法
+文件：`aimemory/services/interaction_service.py`
 
-| 方法 | 说明 |
+公开方法：
+
+| 方法 | 作用 |
 | --- | --- |
 | `create_session(...)` | 创建会话 |
 | `get_session(session_id)` | 读取会话 |
-| `append_turn(...)` | 写入轮次 |
-| `list_turns(session_id, limit=20, offset=0)` | 列出轮次 |
-| `upsert_snapshot(...)` | 写 / 更新工作记忆快照 |
+| `append_turn(...)` | 写入 turn |
+| `list_turns(session_id, limit=20, offset=0)` | 列表 turn |
+| `upsert_snapshot(...)` | 写或更新 working memory snapshot |
 | `set_tool_state(...)` | 保存工具状态 |
-| `set_variable(session_id, key, value)` | 保存会话变量 |
-| `get_context(session_id, limit=12)` | 拉取会话上下文 |
-| `compress_session_context(...)` | 压缩会话 |
-| `session_health(session_id)` | 会话健康检查 |
-| `prune_snapshots(session_id)` | 清理旧快照 |
+| `set_variable(session_id, key, value)` | 保存 session 变量 |
+| `get_context(session_id, limit=12)` | 获取 session 上下文 |
+| `compress_session_context(...)` | 本地压缩 session |
+| `session_health(session_id)` | 健康检查 |
+| `prune_snapshots(session_id, ...)` | 清理旧 snapshot |
 | `clear_session(session_id)` | 清理会话关联内容 |
 
-### `get_context()` 返回
+注意：
 
-通常包括：
+- façade 的 `api.session.*` 会额外处理 scope、ACL、自动 capture、事件编排
+- 直接下沉到 service 时，这些语义需要你自己补
 
-- `session`
-- `turns`
-- `snapshot`
-- `variables`
-- `tool_states`
+## 5. `KnowledgeService`
 
-## 4. `KnowledgeService`
+文件：`aimemory/services/knowledge_service.py`
 
-### 核心方法
+公开方法：
 
-| 方法 | 说明 |
+- `create_source(...)`
+- `ingest_text(...)`
+- `get_document(document_id)`
+- `list_documents(...)`
+- `get_document_text(document_id)`
+
+定位：
+
+- 更接近知识入库流水线
+- 不负责完整多智能体协作语义
+
+## 6. `SkillService`
+
+文件：`aimemory/services/skill_service.py`
+
+公开方法：
+
+- `register(...)`
+- `get_skill(skill_id)`
+- `list_skills(status=None, owner_agent_id=None)`
+
+说明：
+
+- façade 层的 skill 能力更完整，因为额外包含 reference 搜索、execution context 刷新和 ACL
+
+## 7. `ArchiveService`
+
+文件：`aimemory/services/archive_service.py`
+
+公开方法：
+
+- `archive_session(session_id, ...)`
+- `archive_memory(memory_id, ...)`
+- `get_archive(archive_unit_id)`
+- `restore_archive(archive_unit_id)`
+
+## 8. `ExecutionService`
+
+文件：`aimemory/services/execution_service.py`
+
+公开方法：
+
+- `start_run(...)`
+- `get_run(run_id)`
+- `update_run(run_id, status, metadata=None, ended=False)`
+- `create_task(run_id, title, ...)`
+- `get_task(task_id)`
+- `add_task_step(...)`
+- `checkpoint(...)`
+- `log_tool_call(...)`
+- `add_observation(...)`
+- `get_run_timeline(run_id)`
+
+## 9. `RetrievalService`
+
+文件：`aimemory/services/retrieval_service.py`
+
+构造时可注入：
+
+- `router`
+- `reranker`
+- `index_backend`
+- `graph_backend`
+- `recall_planner`
+
+公开方法：
+
+| 方法 | 作用 |
 | --- | --- |
-| `create_source(name, source_type, ...)` | 创建知识源 |
-| `ingest_text(title, text, ...)` | 写入文档文本 |
-| `get_document(document_id)` | 获取文档 |
-| `list_documents(...)` | 列出文档 |
-| `get_document_text(document_id)` | 读取文档正文 |
+| `search_memory(query, ...)` | 搜记忆 |
+| `retrieve(query, ...)` | 统一检索 |
+| `search_interaction(query, ...)` | 搜会话交互 |
+| `search_knowledge(query, ...)` | 搜知识切块 |
+| `search_skills(query, ...)` | 搜技能 |
+| `search_archive(query, ...)` | 搜归档 |
+| `search_execution(query, ...)` | 搜执行记录 |
+| `plan_memory_recall(query, ...)` | recall plan |
+| `explain_memory_recall(query, ...)` | recall 解释 |
 
-### 适合场景
+适合场景：
 
-- 需要自己管理知识源
-- 需要手动定义版本标签
-- 需要批量文档入库流程
+- 做定制 router / planner / reranker
+- 离线检索实验
+- 独立检索服务封装
 
-## 5. `SkillService`
+## 10. `ProjectionService`
 
-### 核心方法
+文件：`aimemory/services/projection_service.py`
 
-| 方法 | 说明 |
-| --- | --- |
-| `register(name, description, ...)` | 注册技能 |
-| `get_skill(skill_id)` | 获取技能 |
-| `list_skills(status=None, owner_agent_id=None)` | 列出技能 |
+作用：
 
-### 技能适合承载的内容
+- 处理投影队列
+- 把 memory / knowledge chunk / skill / archive / context / handoff / reflection 写入向量索引
+- 可选构建图关系
 
-- prompt 模板
-- workflow
-- 工具绑定
-- 测试样例
-- capability 标签
+公开方法：
 
-补充说明：
+- `enqueue(...)`
+- `project_pending(limit=None)`
 
-- `SkillService` 不再提供版本激活语义；一个 skill 在任意时刻只维护一个 `current_snapshot`
-- 调用 `register(...)` 更新同名 skill 时，会直接替换当前快照
+如果你要替换向量后端或增加图投影，这是关键入口。
 
-## 6. `ArchiveService`
+## 11. `MemoryIntelligencePipeline`
 
-### 核心方法
+文件：`aimemory/memory_intelligence/pipeline.py`
 
-| 方法 | 说明 |
-| --- | --- |
-| `archive_session(session_id, ...)` | 归档会话 |
-| `archive_memory(memory_id, ...)` | 归档单条记忆 |
-| `get_archive(archive_unit_id)` | 获取归档信息 |
-| `restore_archive(archive_unit_id)` | 从对象存储恢复 payload |
+职责：
 
-### `restore_archive()` 返回
+- 规范化消息
+- 事实候选抽取
+- 邻域召回
+- 动作规划
+- 执行动作：`ADD / UPDATE / SUPERSEDE / MERGE / LINK / DELETE`
 
-通常包含：
+核心方法：
 
-- `archive`
-- `payload`
+- `add(messages, context=..., metadata=..., long_term=True, ...)`
 
-## 7. `ExecutionService`
+内部关键阶段：
 
-### 核心方法
+1. `vision_processor.normalize(...)`
+2. `extractor.extract(...)`
+3. `_retrieve_neighbors(...)`
+4. `planner.plan(...)`
+5. `_apply_action(...)`
 
-| 方法 | 说明 |
-| --- | --- |
-| `start_run(...)` | 创建 run |
-| `get_run(run_id)` | 获取 run |
-| `update_run(run_id, ...)` | 更新 run 状态 |
-| `create_task(run_id, title, ...)` | 创建任务 |
-| `get_task(task_id)` | 获取任务 |
-| `add_task_step(...)` | 增加步骤 |
-| `checkpoint(run_id, snapshot, ...)` | 保存 checkpoint |
-| `log_tool_call(...)` | 记录工具调用 |
-| `add_observation(...)` | 增加观察 |
-| `get_run_timeline(run_id)` | 拉取时间线 |
+这部分是“自动记忆写入”的主引擎。
 
-### `get_run_timeline()` 返回
+## 12. Worker
 
-通常包括：
+### `SessionCompactionWorker`
 
-- `run`
-- `tasks`
-- `steps`
-- `checkpoints`
-- `tool_calls`
-- `observations`
+文件：`aimemory/workers/compactor.py`
 
-## 8. `RetrievalService`
+作用：
 
-### 核心方法
+- 定时触发 `compress_session_context(...)`
 
-| 方法 | 说明 |
-| --- | --- |
-| `search_memory(query, ...)` | 搜索记忆 |
-| `retrieve(query, ...)` | 统一检索入口 |
-| `search_interaction(query, ...)` | 搜索交互上下文 |
-| `search_knowledge(query, ...)` | 搜索知识库 |
-| `search_skills(query, ...)` | 搜索技能 |
-| `search_archive(query, ...)` | 搜索归档 |
-| `search_execution(query, ...)` | 搜索执行记录 |
-| `plan_memory_recall(query)` | 规划召回 |
-| `explain_memory_recall(query)` | 解释召回过程 |
+### `SessionMemoryPromoterWorker`
 
-### 使用建议
+文件：`aimemory/workers/distiller.py`
 
-- 平台业务层优先用 `AIMemory.api.recall.query()`
-- 如果你在做自定义检索编排，再下沉到 `RetrievalService`
+作用：
 
-## 9. `ProjectionService`
+- 把 session memory 晋升为 long-term memory
 
-### 核心方法
+### `LowValueMemoryCleanerWorker`
 
-| 方法 | 说明 |
-| --- | --- |
-| `enqueue(topic, entity_type, entity_id, action, payload)` | 加入投影队列 |
-| `project_pending(limit)` | 执行待处理投影 |
+文件：`aimemory/workers/cleaner.py`
 
-适合：
+作用：
 
-- 做异步索引刷新
-- 控制重建节奏
-- 做批处理投影
+- 清理低价值记忆
+- 可联动归档
 
-## 10. Worker 层总览
+### `GovernanceAutomationWorker`
 
-当前 Worker：
+文件：`aimemory/workers/governor.py`
 
-| Worker | 作用 |
-| --- | --- |
-| `LowValueMemoryCleanerWorker` | 清理低价值记忆 |
-| `SessionCompactionWorker` | 压缩会话上下文 |
-| `SessionMemoryPromoterWorker` | 晋升会话记忆 |
-| `GovernanceAutomationWorker` | 组合治理 |
-| `ProjectorWorker` | 批量执行投影 |
+作用：
 
-## 11. `LowValueMemoryCleanerWorker`
+- 把 session health、压缩、晋升、清理串成治理流程
 
-### 方法
+### `ProjectorWorker`
 
-| 方法 | 说明 |
-| --- | --- |
-| `run_once()` | 执行一次清理 |
-| `run_forever(poll_interval)` | 持续轮询执行 |
-| `describe_capabilities()` | 输出能力说明 |
+文件：`aimemory/workers/projector.py`
 
-### 适合场景
+作用：
 
-- 定时清理长期无价值记忆
-- 控制本地存储膨胀
+- 持续消费投影队列
 
-## 12. `SessionCompactionWorker`
+## 13. 与平台 LLM 的边界
 
-### 方法
+需要特别区分两类压缩：
 
-| 方法 | 说明 |
-| --- | --- |
-| `run_once(session_id)` | 压缩一个 session |
-| `run_forever(session_ids, poll_interval)` | 周期性压缩多个 session |
-| `describe_capabilities()` | 输出能力说明 |
+### 本地算法压缩
 
-### 适合场景
+典型入口：
 
-- 长对话 Agent
-- 上下文成本需要持续控制
+- `InteractionService.compress_session_context(...)`
+- `AIMemory.compress_text(...)`
+- `AIMemory.compress_document(...)`
+- memory / archive / skill reference 的域级压缩
 
-## 13. `SessionMemoryPromoterWorker`
+特点：
 
-### 方法
+- 稳定
+- 无外部依赖
+- 适合在线 runtime 的基础窗口治理
 
-| 方法 | 说明 |
-| --- | --- |
-| `run_once(session_id)` | 对一个 session 执行晋升 |
-| `run_forever(session_ids, poll_interval)` | 周期性晋升多个 session |
-| `describe_capabilities()` | 输出能力说明 |
+### 平台 LLM 压缩
 
-### 适合场景
+推荐入口：
 
-- 在任务结束后沉淀经验
-- 周期性把短期结论升级为长期记忆
+- `AIMemory.api.context.build(...)`
+- `AIMemory.api.handoff.build(...)`
+- `AIMemory.api.reflection.session(...)`
+- `AIMemory.api.reflection.run(...)`
 
-## 14. `GovernanceAutomationWorker`
+特点：
 
-### 方法
+- 走平台 LLM 插件
+- 有本地回退
+- 会记录 `compression_jobs`
 
-| 方法 | 说明 |
-| --- | --- |
-| `assess_session(session_id)` | 评估会话治理需求 |
-| `run_once(session_id)` | 对单个 session 执行治理 |
-| `run_forever(session_ids, poll_interval)` | 周期性治理 |
-| `describe_capabilities()` | 输出能力说明 |
+因此，如果你在做平台接入，不要在 service 层直接塞一个“外部 LLM 调用”；应通过 façade 的插件路径统一接入。
 
-### 治理通常组合
+## 14. 二开建议
 
-- 压缩
-- 晋升
-- snapshot 清理
-- 低价值清理建议
+如果你要对 `aimemory` 继续扩展，优先选择下面这些扩展点：
 
-## 15. `ProjectorWorker`
+- 平台 LLM：`register_platform_llm_plugin(...)`
+- 平台事件：自定义 `PlatformEventAdapter`
+- 抽取 / 规划：替换 `MemoryIntelligencePipeline` 的 extractor / planner
+- 检索：替换 `RetrievalService` 的 router / planner / reranker
+- 投影：替换 `ProjectionService` 的 index / graph backend
 
-### 方法
+不建议做的事：
 
-| 方法 | 说明 |
-| --- | --- |
-| `run_once(limit)` | 执行一次投影 |
-| `run_forever(poll_interval, limit)` | 持续执行投影 |
-| `describe_capabilities()` | 输出能力说明 |
-
-## 16. 推荐使用策略
-
-### 业务项目
-
-优先顺序：
-
-1. `AIMemory`
-2. `ScopedAIMemory`
-3. `AIMemoryMCPAdapter`
-
-### 平台 / Runtime 项目
-
-优先顺序：
-
-1. `AIMemory` 统一入口
-2. `services/*` 做精细控制
-3. `workers/*` 做后台自动治理
-
-### 不推荐
-
-不建议一开始就直接围绕 Service + Worker 自己拼完整流程，原因是：
-
-- 作用域处理更容易出错
-- 跨域查询要自己协调
-- 平台迭代成本更高
+- 在业务层绕开 façade 直接拼 SQL
+- 把平台 LLM 压缩塞进 MCP 工具调用链
+- 把所有正文都强制外置为本地文件
