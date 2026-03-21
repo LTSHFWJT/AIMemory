@@ -35,8 +35,16 @@ all = [
   "mcp>=1.0.0",
 ]
 
-[tool.setuptools.packages.find]
-include = ["aimemory*"]
-
 [tool.setuptools]
 include-package-data = true
+packages = [
+  "aimemory",
+  "aimemory.catalog",
+  "aimemory.hotstore",
+  "aimemory.pipeline",
+  "aimemory.plugins",
+  "aimemory.vector",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

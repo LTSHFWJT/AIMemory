@@ -1,364 +1,462 @@
 # AIMemory API Reference
 
-本文档描述当前仓库中对外推荐的公共调用面，重点覆盖多人多智能体协同平台需要直接依赖的对象。
-
-## 1. 公共对象
-
-### `AIMemory`
-
-同步主入口。
-
-```python
-from aimemory import AIMemory
-
-memory = AIMemory(
-    {"root_dir": ".aimemory"},
-    platform_llm=None,
-    platform_events=None,
-)
-```
-
-常用成员：
-
-| 成员 | 说明 |
-| --- | --- |
-| `api` | 结构化 API 根入口 |
-| `events` | 平台事件适配器 |
-| `scoped(**scope_kwargs)` | 创建固定作用域句柄 |
-| `bind_platform_llm(...)` | 运行时绑定平台 LLM 或平台 LLM 插件 |
-| `create_mcp_adapter(scope=None)` | 创建 MCP 适配器，属于可选工具面 |
-| `describe_capabilities()` | 返回当前能力、存储和插件信息 |
-| `storage_layout(**scope_kwargs)` | 返回存储布局 |
-| `compress_text(...)` | 本地算法文本压缩 |
-| `compress_document(...)` | 单文档本地压缩 |
-| `close()` | 关闭实例 |
-
-### `ScopedAIMemory`
-
-适合把一组 scope 固定下来，给一个 agent、一个工作区或一个协作任务复用。
-
-```python
-scoped = memory.scoped(
-    workspace_id="ws.alpha",
-    team_id="team.alpha",
-    owner_agent_id="agent.planner",
-    subject_type="agent",
-    subject_id="agent.executor",
-    interaction_type="agent_agent",
-)
-```
-
-常用成员：
-
-| 成员 | 说明 |
-| --- | --- |
-| `api` | 自动继承 scope 的结构化 API |
-| `using(**scope_overrides)` | 派生新的 scoped 句柄 |
-| `scope_dict()` | 返回当前解析后的 scope |
-| `storage_layout()` | 查看 scoped 存储布局 |
-| `create_mcp_adapter()` | 创建带默认 scope 的 MCP adapter |
-
-### `AsyncAIMemory`
-
-异步包装器。底层仍复用同步内核，通过 `asyncio.to_thread(...)` 调用。
-
-```python
-from aimemory import AsyncAIMemory
-
-memory = AsyncAIMemory({"root_dir": ".aimemory-async"})
-await memory.api.long_term.add("异步也使用同一组 API。")
-await memory.close()
-```
-
-### `AIMemoryMCPAdapter`
-
-可选工具面。
-
-对外提供：
-
-- `manifest()`
-- `tool_specs()`
-- `call_tool(name, arguments=None)`
-- `bind_fastmcp(server=None)`
-
-### 平台插件注册函数
+## 顶层导出
 
 ```python
 from aimemory import (
-    register_platform_llm_plugin,
-    unregister_platform_llm_plugin,
-    list_platform_llm_plugins,
-    create_platform_llm_plugin,
+    AIMemory,
+    MemoryDB,
+    ScopedMemoryDB,
+    Scope,
+    MemoryDraft,
+    SearchHit,
+    SearchQuery,
+    SearchResult,
+    HashEmbedder,
+    Extractor,
+    RetrievalGate,
+    Reranker,
 )
 ```
 
-用途：
-
-- 为平台自己的 LLM 压缩器注册工厂
-- 通过配置或运行时绑定方式解析插件
-- 不要求 LangChain，不要求 MCP
-
-## 2. 配置对象
-
-### `AIMemoryConfig`
-
-常用字段：
-
-| 字段 | 说明 |
-| --- | --- |
-| `root_dir` | 根目录 |
-| `sqlite_path` | SQLite 数据库路径 |
-| `lancedb_path` | LanceDB 根路径 |
-| `object_store_path` | 对象存储目录 |
-| `platform_id / workspace_id / team_id / project_id` | 默认平台 scope |
-| `default_user_id` | 默认用户 |
-| `storage_profile` | 当前存储策略名称 |
-| `knowledge_raw_store_policy` | 知识正文外置策略 |
-| `memory_inline_char_limit` | memory 文本内联阈值 |
-| `providers` | LLM provider 配置 |
-| `embeddings` | embedding 配置 |
-| `platform_llm_plugin` | 平台 LLM 插件配置 |
-| `memory_policy` | 记忆、召回、压缩策略 |
-
-### `PlatformLLMPluginConfig`
-
-平台 LLM 插件配置模型：
+## Scope
 
 ```python
-{
-    "name": "platform.llm",
-    "settings": {"endpoint": "https://..."},
-    "enabled": True,
-}
+from aimemory import Scope
+
+scope = Scope(
+    tenant_id="local",
+    workspace_id="ws.alpha",
+    project_id="proj.release",
+    user_id="user-1",
+    agent_id="planner",
+    session_id="sess-001",
+    run_id="run-001",
+    namespace="default",
+    visibility="private",
+)
 ```
 
-也支持简写：
+字段：
 
-```python
-{
-    "name": "platform.llm",
-    "endpoint": "https://...",
-}
-```
-
-未知字段会自动并入 `settings`。
-
-## 3. Scope 模型
-
-所有结构化 API 都支持同一组作用域字段：
-
-| 字段 | 作用 |
-| --- | --- |
-| `user_id` | 当前用户标识 |
-| `agent_id` | 当前调用 agent |
-| `owner_agent_id` | 资源拥有者 agent |
-| `subject_type` | `human` 或 `agent` |
-| `subject_id` | 主体标识 |
-| `interaction_type` | 推荐 `human_agent` 或 `agent_agent` |
-| `platform_id` | 平台标识 |
-| `workspace_id` | 工作区标识 |
-| `team_id` | 团队标识 |
-| `project_id` | 项目标识 |
-| `namespace_key` | 手工命名空间；不传则自动推导 |
-
-`namespace_key` 的自动推导来自 `CollaborationScope.resolved_namespace_key()`。
-
-## 4. Structured API 命名空间
-
-### `api.long_term`
-
-| 方法 | 说明 |
-| --- | --- |
-| `add(text, **kwargs)` | 写长期记忆 |
-| `get(memory_id, **kwargs)` | 获取单条记忆 |
-| `list(**kwargs)` | 列表 |
-| `search(query, **kwargs)` | 搜索 |
-| `update(memory_id, **kwargs)` | 更新 |
-| `supersede(memory_id, **kwargs)` | 建立版本替代关系 |
-| `history(memory_id, **kwargs)` | 审计历史 |
-| `link(memory_id, target_memory_ids, **kwargs)` | 建立 memory link |
-| `delete(memory_id, **kwargs)` | 删除 |
-| `compress(**kwargs)` | 域级本地压缩 |
-
-### `api.short_term`
-
-方法与 `long_term` 对齐，建议同时传：
-
+- `tenant_id`
+- `workspace_id`
+- `project_id`
+- `user_id`
+- `agent_id`
 - `session_id`
 - `run_id`
+- `namespace`
+- `visibility`
 
-### `api.knowledge`
+辅助方法：
 
-| 方法 | 说明 |
-| --- | --- |
-| `add(title, text, **kwargs)` | 新建知识文档 |
-| `get(document_id)` | 获取完整文档 |
-| `list(**kwargs)` | 列表 |
-| `search(query, **kwargs)` | 搜索文档与切块 |
-| `update(document_id, **kwargs)` | 更新 |
-| `delete(document_id)` | 删除 |
-| `compress(document_id, **kwargs)` | 单文档本地压缩 |
+- `Scope.from_value(value)`
+- `Scope.from_record(record)`
+- `scope.bind(**overrides)`
+- `scope.path`
+- `scope.key`
 
-### `api.skill`
+## 类型对象
 
-| 方法 | 说明 |
-| --- | --- |
-| `add(name, description, **kwargs)` | 创建或更新 skill |
-| `get(skill_id)` | 读取 skill 内容 |
-| `list(**kwargs)` | 列表 |
-| `search(query, **kwargs)` | 搜 skill 主体 |
-| `search_references(query, **kwargs)` | 搜索 reference 切块 |
-| `refresh_execution_context(skill_id, **kwargs)` | 刷新 execution context |
-| `compress_references(skill_id, **kwargs)` | 本地压缩 reference bundle |
-| `update(skill_id, **kwargs)` | 更新 |
-| `delete(skill_id)` | 删除 |
+### `MemoryDraft`
 
-### `api.archive`
+```python
+draft = {
+    "text": "用户喜欢先给结论。",
+    "kind": "preference",
+    "layer": "longterm",
+    "tier": "active",
+    "importance": 0.9,
+    "confidence": 0.8,
+    "fact_key": "style.answer",
+    "metadata": {"channel": "chat"},
+    "source_type": "message",
+    "source_ref": "msg-1",
+}
+```
 
-| 方法 | 说明 |
-| --- | --- |
-| `add(summary, **kwargs)` | 新建归档 |
-| `get(archive_unit_id)` | 读取归档 |
-| `list(**kwargs)` | 列表 |
-| `search(query, **kwargs)` | 搜索 |
-| `update(archive_unit_id, **kwargs)` | 更新 |
-| `delete(archive_unit_id)` | 删除 |
-| `compress(**kwargs)` | 域级本地压缩 |
+### `SearchQuery`
 
-### `api.session`
+```python
+from aimemory import SearchQuery
 
-| 方法 | 说明 |
-| --- | --- |
-| `create(**kwargs)` | 创建会话 |
-| `get(session_id)` | 获取会话 |
-| `append(session_id, role, content, **kwargs)` | 追加 turn，并可自动抽取记忆和压缩 |
-| `compress(session_id, **kwargs)` | 本地压缩 session context |
-| `promote(session_id, **kwargs)` | 短期记忆晋升长期 |
-| `health(session_id)` | 返回 session 健康信息 |
-| `prune(session_id)` | 清理历史 snapshot |
-| `archive(session_id, **kwargs)` | 归档会话 |
-| `govern(session_id, **kwargs)` | 运行治理流程 |
-| `reflect(session_id, **kwargs)` | 调 `reflection.session(...)` |
+query = SearchQuery(
+    query="回答风格偏好",
+    top_k=5,
+    filters={"tier": {"in": ["active", "core"]}},
+)
+```
 
-### `api.execution`
+### `SearchResult`
 
-| 方法 | 说明 |
-| --- | --- |
-| `start_run(user_id=None, goal=\"\", **kwargs)` | 创建 run |
-| `search(query, **kwargs)` | 搜执行记录 |
+```python
+from aimemory import SearchResult
+```
 
-### `api.recall`
+包含：
 
-| 方法 | 说明 |
-| --- | --- |
-| `query(query, **kwargs)` | 统一召回 |
-| `plan(query, **kwargs)` | recall plan |
-| `explain(query, **kwargs)` | recall 解释 |
-| `compress_text(text, **kwargs)` | 本地文本压缩 |
-| `context(query, **kwargs)` | `build_context(...)` 的别名入口 |
+- `query`
+- `hits`
+- `used_working_memory`
+- `used_longterm_memory`
 
-### `api.context`
+### `SearchHit`
 
-| 方法 | 说明 |
-| --- | --- |
-| `build(query, **kwargs)` | 构建 prompt context artifact |
-| `search(query, **kwargs)` | 搜上下文产物 |
-| `get(artifact_id, **kwargs)` | 获取 artifact |
-| `list(**kwargs)` | 列表 |
+搜索结果字段：
 
-### `api.handoff`
+- `head_id`
+- `version_id`
+- `chunk_id`
+- `kind`
+- `layer`
+- `tier`
+- `text`
+- `abstract`
+- `overview`
+- `score`
+- `lexical_score`
+- `vector_score`
+- `access_count`
+- `valid_from`
+- `valid_to`
+- `metadata`
 
-| 方法 | 说明 |
-| --- | --- |
-| `build(target_agent_id, **kwargs)` | 生成 handoff pack |
-| `search(query, **kwargs)` | 搜 handoff pack |
-| `get(handoff_id, **kwargs)` | 获取 handoff |
-| `list(**kwargs)` | 列表 |
+## 可插拔协议
 
-### `api.reflection`
+### `Extractor`
 
-| 方法 | 说明 |
-| --- | --- |
-| `session(session_id, **kwargs)` | 会话反思 |
-| `run(run_id, **kwargs)` | run 反思 |
-| `search(query, **kwargs)` | 搜 reflection memory |
-| `get(reflection_id, **kwargs)` | 获取 reflection |
-| `list(**kwargs)` | 列表 |
+```python
+from aimemory import Extractor
 
-### `api.acl`
+class MyExtractor:
+    def extract(self, messages, scope):
+        return [{"text": "提取出的记忆", "kind": "fact"}]
+```
 
-| 方法 | 说明 |
-| --- | --- |
-| `get(rule_id, **kwargs)` | 获取 ACL 规则 |
-| `list(**kwargs)` | 列表 |
-| `grant(**kwargs)` | 授权 |
-| `revoke(rule_id=None, **kwargs)` | 撤销 |
+### `RetrievalGate`
 
-## 5. 平台事件 API
+```python
+from aimemory import RetrievalGate
 
-默认 `memory.events` 对外提供：
+class MyGate:
+    def should_retrieve(self, query, scope):
+        return "历史" in query or "remember" in query.lower()
+```
 
-| 方法 | 说明 |
-| --- | --- |
-| `on_turn_end(**payload)` | turn 结束后可自动压缩 / recall / build context |
-| `on_agent_end(**payload)` | agent 结束后可自动压缩 / context / reflection |
-| `on_handoff(**payload)` | 生成 handoff，并可附带 context |
-| `on_session_close(session_id, **payload)` | 关闭 session，并可压缩 / reflection / prune / archive |
+### `Reranker`
 
-这些方法适合挂在协同平台的 runtime lifecycle hooks 上。
+```python
+from aimemory import Reranker
 
-## 6. 平台 LLM 压缩入口
+class MyReranker:
+    def rerank(self, query, docs, top_k):
+        return [(index, 1.0) for index in range(min(top_k, len(docs)))]
+```
 
-只有下面这些高级语义压缩入口支持 `use_platform_llm=True`：
+## MemoryDB
 
-- `api.context.build(...)`
-- `api.handoff.build(...)`
-- `api.reflection.session(...)`
-- `api.reflection.run(...)`
+### 打开数据库
 
-语义：
+```python
+db = AIMemory.open(".aimemory")
+```
 
-- 若已绑定平台 LLM 插件，则优先走平台压缩
-- 若平台插件异常或缺失，则回退本地压缩
-- job 状态会区分 `completed` 和 `degraded`
+或：
 
-## 7. ACL 语义
+```python
+from aimemory import MemoryDB, MemoryConfig
 
-当前资源类型覆盖：
+db = MemoryDB(
+    MemoryConfig(root_dir=".aimemory"),
+    reranker=my_reranker,
+    retrieval_gate=my_gate,
+)
+```
 
-- `memory`
-- `knowledge`
-- `skill`
-- `archive`
-- `session`
-- `context`
-- `handoff`
-- `reflection`
-- `all`
+### `put`
 
-权限语义：
+```python
+record = db.put(
+    scope=scope,
+    text="用户喜欢先给结论，再给步骤。",
+    kind="preference",
+    layer="longterm",
+    tier="active",
+    importance=0.9,
+    confidence=0.8,
+    fact_key="style.answer",
+    metadata={"channel": "chat"},
+    source_type="message",
+    source_ref="msg-1",
+)
+```
 
-- `read`
-- `write`
-- `manage`
+### `put_many`
 
-当前代码已把 `write / manage` 校验下沉到更多修改型接口，不再只停留在单纯的 memory id 前置校验。
+```python
+records = db.put_many(
+    scope=scope,
+    items=[
+        {"text": "使用 SQLite 作为事实源。", "kind": "fact"},
+        {"text": "使用 LMDB 维护工作记忆。", "kind": "fact"},
+    ],
+)
+```
 
-## 8. 能力自检
+`put_many()` now uses a single SQLite transaction for the whole batch and applies LMDB hot-state updates in bulk after commit.
 
-`memory.describe_capabilities()` 当前返回：
+### `ingest_records`
 
-- `core`
-- `platform`
-- `embeddings`
-- `vector_index`
-- `graph_store`
-- `algorithms`
-- `mcp`
+```python
+records = db.ingest_records(
+    scope=scope,
+    records=[
+        {"text": "SQLite stores durable metadata.", "kind": "fact"},
+        {"text": "LMDB stores hot working state.", "kind": "fact"},
+    ],
+)
+```
 
-其中 `platform` 会标出：
+### `ingest_jsonl`
 
-- 当前注册的平台 LLM 插件列表
-- 当前配置的 `platform_llm_plugin`
-- 当前激活的 provider / model
-- 当前平台事件适配器名称
+```python
+records = db.ingest_jsonl(
+    scope=scope,
+    path="imports/memory.jsonl",
+)
+```
+
+### `ingest_messages`
+
+```python
+records = db.ingest_messages(
+    scope=scope,
+    messages=[
+        {"role": "user", "content": "Need concise rollout notes."},
+        {"role": "assistant", "content": "Will keep the answer short."},
+    ],
+    extractor=my_extractor,
+)
+```
+
+### `get`
+
+```python
+record = db.get(scope=scope, head_id=head_id)
+```
+
+### `list`
+
+```python
+records = db.list(
+    scope=scope,
+    filters={"kind": {"in": ["fact", "preference"]}},
+    limit=50,
+)
+```
+
+支持的 filter 操作：
+
+- `eq`
+- `ne`
+- `in`
+- `gte`
+- `lte`
+- `contains`
+
+### `search`
+
+```python
+hits = db.search(
+    scope=scope,
+    query="回答风格偏好",
+    top_k=5,
+    filters={"tier": {"in": ["active", "core"]}},
+)
+```
+
+搜索路径：
+
+- 先查 LMDB `working_set / turn_buffer`
+- 再由 `RetrievalGate` 决定是否进入长期记忆检索
+- 长期记忆检索采用 SQLite FTS5 + LanceDB hybrid retrieval
+- 可选再经过 `Reranker`
+
+### `history`
+
+```python
+history = db.history(scope=scope, head_id=head_id)
+```
+
+返回：
+
+- `versions`
+- `events`
+
+### `delete`
+
+```python
+deleted = db.delete(scope=scope, head_id=head_id)
+```
+
+### `restore`
+
+```python
+restored = db.restore(scope=scope, head_id=head_id)
+```
+
+### `feedback`
+
+```python
+updated = db.feedback(
+    scope=scope,
+    head_id=head_id,
+    text="新的修正内容",
+)
+```
+
+### `working_append`
+
+```python
+db.working_append(
+    scope=scope,
+    role="user",
+    content="需要一个发布 checklist",
+    metadata={"source": "chat"},
+)
+```
+
+### `working_snapshot`
+
+```python
+snapshot = db.working_snapshot(scope=scope, limit=20)
+```
+
+### `export_records`
+
+```python
+records = db.export_records(
+    scope=scope,
+    filters={"kind": {"in": ["fact", "preference"]}},
+    limit=100,
+)
+```
+
+### `export_jsonl`
+
+```python
+result = db.export_jsonl(
+    scope=scope,
+    path="exports/memory.jsonl",
+)
+```
+
+Returns a small result object with `path` and `count`.
+
+### `import_jsonl`
+
+```python
+records = db.import_jsonl(
+    path="exports/memory.jsonl",
+    scope=scope,
+)
+```
+
+If `scope` is omitted, the importer uses the embedded `scope` from exported records.
+
+### `flush`
+
+```python
+stats = db.flush()
+```
+
+执行：
+
+- outbox job flush
+- access delta flush
+- lifecycle tier rebalance
+
+### `run_lifecycle`
+
+```python
+stats = db.run_lifecycle()
+```
+
+Executes active/core/cold tier promotion and demotion, then refreshes vector rows for changed heads.
+
+### `recover`
+
+```python
+stats = db.recover()
+```
+
+执行启动补偿恢复并重放 pending/failed/running 的索引任务，同时刷回未提交的 access delta。
+
+### `compact`
+
+```python
+db.compact()
+```
+
+### `reindex`
+
+```python
+count = db.reindex()
+```
+
+### `stats`
+
+```python
+stats = db.stats()
+```
+
+当前返回：
+
+- `heads`
+- `versions`
+- `chunks`
+- `pending_jobs`
+
+### `scoped`
+
+```python
+scoped = db.scoped(scope)
+```
+
+## ScopedMemoryDB
+
+```python
+scoped = db.scoped(scope)
+
+scoped.put(text="用户偏好短答案。", kind="preference")
+hits = scoped.search("回答偏好")
+snapshot = scoped.working_snapshot()
+```
+
+支持方法：
+
+- `scoped(**overrides)`
+- `put(**kwargs)`
+- `put_many(items)`
+- `ingest_records(records)`
+- `ingest_jsonl(path)`
+- `ingest_messages(messages, extractor=None)`
+- `get(head_id)`
+- `list(filters=None, limit=100)`
+- `search(query, top_k=10, filters=None)`
+- `history(head_id)`
+- `delete(head_id)`
+- `restore(head_id)`
+- `feedback(head_id, text)`
+- `working_append(role, content, metadata=None)`
+- `working_snapshot(limit=None)`
+- `export_records(filters=None, limit=1000, state="active")`
+- `export_jsonl(path=None, filters=None, limit=1000, state="active")`
+- `import_jsonl(path)`
+- `flush()`
+- `run_lifecycle()`
+- `recover()`
+- `compact()`
+- `reindex()`
+- `stats()`
