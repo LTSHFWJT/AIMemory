@@ -1,340 +1,243 @@
-# Service & Worker API
+# AIMemory Maintenance & Worker Model
 
-这份文档面向内核二开者，说明 `aimemory/services/*`、`aimemory/workers/*` 和 `memory_intelligence/*` 的职责边界。
+P0 status update:
 
-先给结论：
+- `worker_mode="library_only"`: no background thread; `auto_flush=True` keeps the foreground maintenance path.
+- `worker_mode="embedded"`: starts an in-process maintenance thread and uses LMDB `lease` for single-leader coordination.
+- access delta flush now triggers on either `flush_access_every` or `flush_access_interval_ms`.
+- `worker_status()` exposes the current maintenance-thread and lease snapshot.
 
-- 业务接入方优先用 façade：`AIMemory.api.*` 和 `memory.events.*`
-- service / worker 更适合批处理、内核扩展、定制算法链路
-- 平台 LLM 压缩仍然建议从 façade 进入，不建议在 service 层直接硬编码平台调用
+这个文件名来自旧文档体系，但当前项目里已经没有公开的 `services/*` / `workers/*` 包。
 
-## 1. 分层关系
+现在的后台处理模型是内嵌式、library-first 的：
 
-```text
-Facade
-  -> scope merge
-  -> ACL
-  -> multi-domain orchestration
-  -> platform event hooks
-  -> platform LLM compression fallback
+- 写入先落 SQLite
+- 向量刷新通过 SQLite outbox job 排队
+- LMDB 维护 job mirror、working memory、缓存和 access delta
+- 维护操作通过 `flush()` / `run_lifecycle()` / `recover()` 触发
 
-Service
-  -> domain-level operations
-  -> closer to tables / projection queue
-  -> reusable building blocks
+所以这份文档描述的是“当前内部维护模型”，不是独立 worker 进程 API。
 
-Worker
-  -> scheduled automation
-  -> compaction / promotion / cleaning / governance / projection
+## 1. 当前组件分工
 
-Memory Intelligence
-  -> candidate extraction
-  -> neighbor recall
-  -> add / update / supersede / merge / delete planning
-```
+### 写入链路
 
-## 2. `ServiceBase`
-
-所有 service 都以 `ServiceBase` 为基类。
-
-构造参数：
-
-- `db`
-- `projection`
-- `config`
-- `object_store=None`
-
-基础能力：
-
-- 行反序列化
-- 对象存储落库辅助
-- 惰性 `_kernel()`，必要时按同一份 `config` 创建内部 `AIMemory`
-
-说明：
-
-- service 不是默认导出的公共对象
-- 你需要自己实例化和编排
-
-## 3. `MemoryService`
-
-文件：`aimemory/services/memory_service.py`
-
-公开方法：
-
-| 方法 | 作用 |
-| --- | --- |
-| `set_intelligence_pipeline(pipeline)` | 替换记忆抽取管线 |
-| `add(messages, **kwargs)` | 批量抽取并写入记忆 |
-| `remember(text, **kwargs)` | 直接写单条记忆 |
-| `get(memory_id)` | 获取记忆 |
-| `get_all(...)` | 列表 |
-| `promote_session_memories(session_id, ...)` | 会话记忆晋升 |
-| `plan_low_value_cleanup(...)` | 规划低价值清理 |
-| `update(memory_id, ...)` | 更新 |
-| `supersede(memory_id, ...)` | 版本替代 |
-| `link(memory_id, target_memory_ids, ...)` | 建立关系 |
-| `delete(memory_id)` | 删除 |
-| `delete_by_query(query, ...)` | 按查询删除 |
-| `history(memory_id)` | 审计历史 |
-| `build_scope_context(...)` | 构建 `MemoryScopeContext` |
-
-适合场景：
-
-- 定制抽取 / 规划算法
-- 批量记忆维护
-- 离线清理与版本修复
-
-## 4. `InteractionService`
-
-文件：`aimemory/services/interaction_service.py`
-
-公开方法：
-
-| 方法 | 作用 |
-| --- | --- |
-| `create_session(...)` | 创建会话 |
-| `get_session(session_id)` | 读取会话 |
-| `append_turn(...)` | 写入 turn |
-| `list_turns(session_id, limit=20, offset=0)` | 列表 turn |
-| `upsert_snapshot(...)` | 写或更新 working memory snapshot |
-| `set_tool_state(...)` | 保存工具状态 |
-| `set_variable(session_id, key, value)` | 保存 session 变量 |
-| `get_context(session_id, limit=12)` | 获取 session 上下文 |
-| `compress_session_context(...)` | 本地压缩 session |
-| `session_health(session_id)` | 健康检查 |
-| `prune_snapshots(session_id, ...)` | 清理旧 snapshot |
-| `clear_session(session_id)` | 清理会话关联内容 |
-
-注意：
-
-- façade 的 `api.session.*` 会额外处理 scope、ACL、自动 capture、事件编排
-- 直接下沉到 service 时，这些语义需要你自己补
-
-## 5. `KnowledgeService`
-
-文件：`aimemory/services/knowledge_service.py`
-
-公开方法：
-
-- `create_source(...)`
-- `ingest_text(...)`
-- `get_document(document_id)`
-- `list_documents(...)`
-- `get_document_text(document_id)`
-
-定位：
-
-- 更接近知识入库流水线
-- 不负责完整多智能体协作语义
-
-## 6. `SkillService`
-
-文件：`aimemory/services/skill_service.py`
-
-公开方法：
-
-- `register(...)`
-- `get_skill(skill_id)`
-- `list_skills(status=None, owner_agent_id=None)`
-
-说明：
-
-- façade 层的 skill 能力更完整，因为额外包含 reference 搜索、execution context 刷新和 ACL
-
-## 7. `ArchiveService`
-
-文件：`aimemory/services/archive_service.py`
-
-公开方法：
-
-- `archive_session(session_id, ...)`
-- `archive_memory(memory_id, ...)`
-- `get_archive(archive_unit_id)`
-- `restore_archive(archive_unit_id)`
-
-## 8. `ExecutionService`
-
-文件：`aimemory/services/execution_service.py`
-
-公开方法：
-
-- `start_run(...)`
-- `get_run(run_id)`
-- `update_run(run_id, status, metadata=None, ended=False)`
-- `create_task(run_id, title, ...)`
-- `get_task(task_id)`
-- `add_task_step(...)`
-- `checkpoint(...)`
-- `log_tool_call(...)`
-- `add_observation(...)`
-- `get_run_timeline(run_id)`
-
-## 9. `RetrievalService`
-
-文件：`aimemory/services/retrieval_service.py`
-
-构造时可注入：
-
-- `router`
-- `reranker`
-- `index_backend`
-- `graph_backend`
-- `recall_planner`
-
-公开方法：
-
-| 方法 | 作用 |
-| --- | --- |
-| `search_memory(query, ...)` | 搜记忆 |
-| `retrieve(query, ...)` | 统一检索 |
-| `search_interaction(query, ...)` | 搜会话交互 |
-| `search_knowledge(query, ...)` | 搜知识切块 |
-| `search_skills(query, ...)` | 搜技能 |
-| `search_archive(query, ...)` | 搜归档 |
-| `search_execution(query, ...)` | 搜执行记录 |
-| `plan_memory_recall(query, ...)` | recall plan |
-| `explain_memory_recall(query, ...)` | recall 解释 |
-
-适合场景：
-
-- 做定制 router / planner / reranker
-- 离线检索实验
-- 独立检索服务封装
-
-## 10. `ProjectionService`
-
-文件：`aimemory/services/projection_service.py`
-
-作用：
-
-- 处理投影队列
-- 把 memory / knowledge chunk / skill / archive / context / handoff / reflection 写入向量索引
-- 可选构建图关系
-
-公开方法：
-
-- `enqueue(...)`
-- `project_pending(limit=None)`
-
-如果你要替换向量后端或增加图投影，这是关键入口。
-
-## 11. `MemoryIntelligencePipeline`
-
-文件：`aimemory/memory_intelligence/pipeline.py`
+- `MemoryWritePath`
+- `SQLiteCatalog`
+- `LMDBHotStore`
 
 职责：
 
-- 规范化消息
-- 事实候选抽取
-- 邻域召回
-- 动作规划
-- 执行动作：`ADD / UPDATE / SUPERSEDE / MERGE / LINK / DELETE`
+- 规范化文本
+- 精确去重
+- 语义去重
+- 版本链维护
+- chunk 切分
+- outbox job 入队
+- working memory / cache 更新
 
-核心方法：
+### 读取链路
 
-- `add(messages, context=..., metadata=..., long_term=True, ...)`
+- `MemoryReadPath`
+- `SQLiteCatalog`
+- `LMDBHotStore`
+- `LanceVectorStore`
 
-内部关键阶段：
+职责：
 
-1. `vision_processor.normalize(...)`
-2. `extractor.extract(...)`
-3. `_retrieve_neighbors(...)`
-4. `planner.plan(...)`
-5. `_apply_action(...)`
+- working-memory-first 检索
+- SQLite FTS5 + LanceDB hybrid retrieval
+- `SearchQuery` / `SearchResult`
+- query cache
 
-这部分是“自动记忆写入”的主引擎。
+### 维护链路
 
-## 12. Worker
+- `MaintenanceCoordinator`
+- `RecoveryCoordinator`
 
-### `SessionCompactionWorker`
+职责：
 
-文件：`aimemory/workers/compactor.py`
+- 刷出 outbox 向量任务
+- 刷回访问增量
+- tier lifecycle 调整
+- 启动恢复
+- reindex / compact
 
-作用：
+## 2. 写入后的后台动作
 
-- 定时触发 `compress_session_context(...)`
+一次 `put()` / `put_many()` 之后，典型过程是：
 
-### `SessionMemoryPromoterWorker`
+1. 记录先写入 SQLite heads / versions / chunks
+2. 为新 chunk 在 outbox 中创建 `upsert_vector` job
+3. LMDB 镜像这些 job，便于快速恢复
+4. 如果 `auto_flush=True`，当前调用会继续触发 `flush()`
+5. `flush_jobs()` 将 chunk 写入 LanceDB
 
-文件：`aimemory/workers/distiller.py`
+对于 supersede 或 delete，还会创建 `delete_vector` job。
 
-作用：
+## 3. outbox job 类型
 
-- 把 session memory 晋升为 long-term memory
+当前主要 job：
 
-### `LowValueMemoryCleanerWorker`
+- `upsert_vector`
+- `delete_vector`
 
-文件：`aimemory/workers/cleaner.py`
+处理逻辑位于 `MaintenanceCoordinator.flush_jobs()`：
 
-作用：
+- `upsert_vector`
+  - 取 chunk
+  - 从 LMDB embedding cache 取向量
+  - 没有就即时 embedding
+  - upsert 到 LanceDB
+- `delete_vector`
+  - 从 LanceDB 删除旧 chunk
 
-- 清理低价值记忆
-- 可联动归档
+## 4. `flush()`
 
-### `GovernanceAutomationWorker`
+公开入口：
 
-文件：`aimemory/workers/governor.py`
+```python
+stats = db.flush()
+```
 
-作用：
+等价于三件事：
 
-- 把 session health、压缩、晋升、清理串成治理流程
+1. `flush_access()`
+2. `run_lifecycle()`
+3. `flush_jobs()`
 
-### `ProjectorWorker`
+返回结构：
 
-文件：`aimemory/workers/projector.py`
+- `jobs`
+- `access_updates`
+- `lifecycle_evaluated`
+- `lifecycle_changed`
+- `lifecycle_jobs`
 
-作用：
+适合：
 
-- 持续消费投影队列
+- 批量写入后的显式收尾
+- 关闭前刷盘
+- 调试时手动推进维护链路
 
-## 13. 与平台 LLM 的边界
+## 5. `run_lifecycle()`
 
-需要特别区分两类压缩：
+公开入口：
 
-### 本地算法压缩
+```python
+stats = db.run_lifecycle()
+```
 
-典型入口：
+当前 tier：
 
-- `InteractionService.compress_session_context(...)`
-- `AIMemory.compress_text(...)`
-- `AIMemory.compress_document(...)`
-- memory / archive / skill reference 的域级压缩
+- `active`
+- `core`
+- `cold`
 
-特点：
+生命周期依据：
 
-- 稳定
-- 无外部依赖
-- 适合在线 runtime 的基础窗口治理
+- `importance`
+- `confidence`
+- `access_count`
+- `updated_at`
+- `last_accessed_at`
 
-### 平台 LLM 压缩
+调整后会：
 
-推荐入口：
+- 更新 `memory_heads.tier`
+- 写入 `history_events`
+- 为当前 version 的 chunks 重新 enqueue `upsert_vector`
 
-- `AIMemory.api.context.build(...)`
-- `AIMemory.api.handoff.build(...)`
-- `AIMemory.api.reflection.session(...)`
-- `AIMemory.api.reflection.run(...)`
+## 6. `recover()`
 
-特点：
+公开入口：
 
-- 走平台 LLM 插件
-- 有本地回退
-- 会记录 `compression_jobs`
+```python
+stats = db.recover()
+```
 
-因此，如果你在做平台接入，不要在 service 层直接塞一个“外部 LLM 调用”；应通过 façade 的插件路径统一接入。
+恢复过程：
 
-## 14. 二开建议
+1. 重置 `pending / failed / running` job 为可恢复状态
+2. 扫描 `embedding_state != ready` 的 chunk，补建 `upsert_vector` job
+3. 重新同步 LMDB job mirror
+4. 持续消费恢复后的 job，直到清空
+5. 刷回 access delta
 
-如果你要对 `aimemory` 继续扩展，优先选择下面这些扩展点：
+默认 `MemoryDB` 初始化时，如果 `recover_on_open=True`，会自动执行一次恢复。
 
-- 平台 LLM：`register_platform_llm_plugin(...)`
-- 平台事件：自定义 `PlatformEventAdapter`
-- 抽取 / 规划：替换 `MemoryIntelligencePipeline` 的 extractor / planner
-- 检索：替换 `RetrievalService` 的 router / planner / reranker
-- 投影：替换 `ProjectionService` 的 index / graph backend
+## 7. `reindex()` 和 `compact()`
 
-不建议做的事：
+### reindex
 
-- 在业务层绕开 façade 直接拼 SQL
-- 把平台 LLM 压缩塞进 MCP 工具调用链
-- 把所有正文都强制外置为本地文件
+```python
+count = db.reindex()
+```
+
+行为：
+
+- 删掉所有 indexable chunks 的 LanceDB 条目
+- 重新 enqueue `upsert_vector`
+- 立即 flush job
+
+### compact
+
+```python
+db.compact()
+```
+
+行为：
+
+- 先执行 `flush_all()`
+- 再执行 SQLite `VACUUM`
+
+## 8. access delta
+
+访问计数不会每次 search 都直接写 SQLite，而是先累积在 LMDB：
+
+- `query()` / `search()` 命中 durable head 时，增加 `access_delta`
+- 达到 `flush_access_every` 阈值后自动刷回
+- `flush()` / `recover()` 也会主动刷回
+
+这样可以降低高频检索下的 SQLite 写放大。
+
+## 9. lease 现状
+
+`LMDBHotStore` 已经有：
+
+```python
+acquire_lease(worker_name, now_ms=..., ttl_ms=...)
+```
+
+但当前版本里它还没有接入公开的 worker loop。
+
+也就是说，当前状态是：
+
+- `lease` 基础设施已存在
+- outbox / recovery / lifecycle 都已存在
+- 但还没有对外暴露“常驻后台线程 / 多进程 worker API”
+
+如果后续要增加嵌入式 worker，这会是直接可复用的互斥基础。
+
+## 10. 当前没有的东西
+
+当前仓库不包含这些公开层：
+
+- `aimemory/services/*`
+- `aimemory/workers/*`
+- 独立 daemon
+- HTTP job control API
+- 事件总线式 scheduler
+
+如果你看到旧文档里提到这些内容，可以直接认为那是已经删除的旧架构。
+
+## 11. 扩展建议
+
+如果你要在当前版本上扩展后台能力，推荐顺序：
+
+1. 优先通过 `flush()` / `run_lifecycle()` / `recover()` 组合现有能力
+2. 如果需要长驻维护，再在进程内封装一个轻量线程循环
+3. 如果需要多进程互斥，复用 LMDB `lease`
+4. 不要把 SQLite / LMDB / LanceDB 的内部表结构直接暴露成外部调度 API
+
+一句话概括：当前项目是“内嵌维护模型”，不是“独立 worker 平台”。

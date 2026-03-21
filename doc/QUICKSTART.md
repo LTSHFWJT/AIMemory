@@ -1,299 +1,287 @@
 # AIMemory Quickstart
 
-这份文档按“平台接入最短路径”来写，目标是让多人多智能体协同平台尽快跑通：
+这份文档只覆盖当前仓库已经实现的能力，目标是让你在几分钟内把 `aimemory` 接进一个多 agent 协作 runtime。
 
-1. 初始化本地存储
-2. 固定一个协作 scope
-3. 写入 session / memory / knowledge
-4. 构建 context / handoff / reflection
-5. 用插件接入平台 LLM 压缩
-
-## 1. 初始化
+## 1. 打开数据库
 
 ```python
 from aimemory import AIMemory
 
-memory = AIMemory({"root_dir": ".aimemory-demo"})
+db = AIMemory.open(".aimemory-demo")
 ```
 
-初始化后会准备：
-
-- SQLite 数据库
-- LanceDB 向量索引目录
-- 本地对象存储目录
-- 运行时 schema、投影队列和检索索引
-
-默认后端：
-
-- relational: SQLite
-- vector: LanceDB
-- graph: disabled
-
-## 2. 固定一个多主体 scope
-
-多智能体平台里，不建议每次手写一组 scope 参数。先生成一个 `ScopedAIMemory`。
+如果你要覆盖默认配置：
 
 ```python
-scoped = memory.scoped(
-    owner_agent_id="agent.planner",
-    subject_type="human",
-    subject_id="user-1",
-    interaction_type="human_agent",
-    platform_id="platform.demo",
+from aimemory import AIMemory, MemoryConfig
+
+db = AIMemory(
+    MemoryConfig(
+        root_dir=".aimemory-demo",
+        auto_flush=True,
+        working_memory_limit=64,
+    )
+)
+```
+
+## 2. 定义 scope
+
+所有 durable memory 都是 scope-first 的。推荐先固定一个 `Scope`：
+
+```python
+from aimemory import Scope
+
+scope = Scope(
     workspace_id="ws.alpha",
-    team_id="team.alpha",
     project_id="proj.release",
+    user_id="user-1",
+    agent_id="planner",
+    session_id="sess-001",
 )
 ```
 
-后续 `scoped.api.*` 调用会自动继承这组作用域。
-
-## 3. 创建 session，并让会话自动沉淀记忆
+如果一个组件会长期复用这组 scope，直接拿 scoped wrapper：
 
 ```python
-session = scoped.api.session.create(user_id="user-1", title="release-plan")
-
-scoped.api.session.append(
-    session["id"],
-    "user",
-    "请记住我偏好先给结论，再给步骤，最后说明风险。",
-)
-
-scoped.api.session.append(
-    session["id"],
-    "assistant",
-    "收到，我会优先保持简洁并保留可执行步骤。",
-)
+scoped = db.scoped(scope)
 ```
 
-`session.append(...)` 默认会做几件事：
+## 3. 写入长期记忆
 
-- 写入 `conversation_turns`
-- 绑定参与者和会话上下文
-- 通过 memory intelligence 尝试抽取短期记忆
-- 达到阈值后触发本地会话压缩，写 `working_memory_snapshots`
-
-## 4. 写长期记忆、知识、技能
-
-### 长期记忆
+### 单条写入
 
 ```python
-scoped.api.long_term.add(
-    "用户偏好先给结论，再给步骤，最后说明风险。",
-    memory_type="preference",
+record = scoped.put(
+    text="用户喜欢先给结论，再给步骤，最后补风险。",
+    kind="preference",
     importance=0.92,
 )
 ```
 
-### 知识文档
+### 批量写入
 
 ```python
-scoped.api.knowledge.add(
-    "发布回滚规范",
-    "失败时先恢复数据库快照，再重启服务并验证健康检查。",
-    source_name="release-playbook",
+records = scoped.put_many(
+    [
+        {"text": "SQLite 是 durable source of truth。", "kind": "fact"},
+        {"text": "LMDB 保存 hot state 和 working memory。", "kind": "fact"},
+    ]
 )
 ```
 
-### Skill
+`put_many()` 会在一个 SQLite 事务里完成整批写入。
+
+### versioned memory
+
+`profile / preference / entity` 会按 `fact_key` 维护版本链：
 
 ```python
-scoped.api.skill.add(
-    "release_handoff",
-    "为执行代理生成轻量交接包。",
-    tools=["search", "summarize"],
-    topics=["handoff", "release"],
-    references={
-        "references/checklist.md": "交接时必须说明约束、开放任务和回滚方案。",
-    },
+scoped.put(
+    text="用户偏好短答案。",
+    kind="preference",
+    fact_key="style.answer",
+)
+
+updated = scoped.put(
+    text="用户偏好短答案，并先给一行结论。",
+    kind="preference",
+    fact_key="style.answer",
 )
 ```
 
-说明：
+第二次写入不会创建新 head，而是 supersede 到同一个 head 的新 version。
 
-- memory 主记录落 SQLite
-- knowledge 大文本按策略可外置到对象存储
-- skill package / reference / script / asset 进入对象存储并可建立索引
+## 4. 使用 working memory
 
-## 5. 统一查询与 recall
+`working memory` 放在 LMDB，适合保存最近对话或临时上下文：
 
 ```python
-result = scoped.api.recall.query(
-    "用户偏好和回滚规范是什么？",
-    session_id=session["id"],
-    domains=["memory", "knowledge", "interaction"],
-    limit=8,
-)
+scoped.working_append("user", "这次发布需要一份回滚清单。")
+scoped.working_append("assistant", "先列出数据库和服务回滚步骤。")
 
-for item in result["results"]:
-    print(item["domain"], item["score"], item["text"][:60])
+snapshot = scoped.working_snapshot()
 ```
 
-如果不手工指定 `domains`，系统会用 router + recall planner 自动选域。
+工作记忆会优先参与检索。
 
-## 6. 构建 context / handoff / reflection
+## 5. 检索
 
-### Prompt context
+### 简单搜索
 
 ```python
-context = scoped.api.context.build(
-    "给当前规划代理最小化上下文",
-    session_id=session["id"],
-    include_domains=["memory", "interaction", "knowledge"],
-    use_platform_llm=False,
-)
+hits = scoped.search("回答风格偏好", top_k=5)
 ```
 
-### Handoff pack
+### typed query
 
 ```python
-handoff = scoped.api.handoff.build(
-    "agent.executor",
-    source_session_id=session["id"],
-    source_agent_id="agent.planner",
-    use_platform_llm=False,
-)
-```
+from aimemory import SearchQuery
 
-### Reflection
-
-```python
-reflection = scoped.api.reflection.session(
-    session["id"],
-    mode="derived+invariant",
-    use_platform_llm=False,
-)
-```
-
-这三类产物都会持久化，而不是临时字符串：
-
-- `context_artifacts`
-- `handoff_packs`
-- `reflection_memories`
-
-## 7. 通过插件注册平台 LLM
-
-高级上下文压缩不应该绑在 MCP 上，而应该直接绑平台自己的 LLM。
-
-```python
-from aimemory import AIMemory, register_platform_llm_plugin
-
-
-class DemoPlatformLLM:
-    provider = "demo-platform"
-    model = "compressor-v1"
-
-    def __init__(self, endpoint: str):
-        self.endpoint = endpoint
-
-    def compress(self, *, task_type, records, budget_chars, scope, metadata=None):
-        return {
-            "summary": f"{task_type} summary",
-            "highlights": ["开放任务", "关键约束"],
-            "steps": ["继续执行", "必要时交接"],
-            "constraints": ["保持轻量"],
-            "facts": [item["text"][:60] for item in records[:2]],
-            "provider": self.provider,
-            "model": self.model,
-        }
-
-
-register_platform_llm_plugin(
-    "demo.platform.llm",
-    lambda config: DemoPlatformLLM(endpoint=str(config["endpoint"])),
-)
-
-memory = AIMemory(
-    {
-        "root_dir": ".aimemory-demo",
-        "platform_llm_plugin": {
-            "name": "demo.platform.llm",
-            "endpoint": "https://platform.internal/llm",
+result = scoped.query(
+    SearchQuery(
+        query="发布相关的高优先级记忆",
+        top_k=5,
+        filters={
+            "kind": {"in": ["fact", "preference"]},
+            "tier": {"in": ["active", "core"]},
+            "importance": {"gte": 0.8},
         },
-    }
+    )
+)
+
+for hit in result.hits:
+    print(hit.head_id, hit.score, hit.text)
+```
+
+搜索路径：
+
+1. 先查 LMDB working memory
+2. 再由 `RetrievalGate` 决定是否进入长期记忆
+3. 长期记忆用 SQLite FTS5 + LanceDB hybrid retrieval
+4. 可选经过 `Reranker`
+
+## 6. 导入与 ingestion
+
+### records
+
+```python
+scoped.ingest_records(
+    [
+        {"text": "LanceDB 负责向量索引。", "kind": "fact"},
+        {"text": "用户偏好结论优先。", "kind": "preference", "fact_key": "style.answer"},
+    ]
 )
 ```
 
-然后在高级压缩入口里打开 `use_platform_llm=True`：
+### JSONL
 
 ```python
-context = memory.api.context.build(
-    "当前协作上下文",
-    owner_agent_id="agent.planner",
-    subject_type="human",
-    subject_id="user-1",
-    use_platform_llm=True,
+scoped.ingest_jsonl("imports/memory.jsonl")
+```
+
+### messages + extractor
+
+```python
+class DemoExtractor:
+    def extract(self, messages, scope):
+        return [
+            {
+                "text": " | ".join(item["content"] for item in messages if item.get("content")),
+                "kind": "summary",
+                "source_type": "message_batch",
+            }
+        ]
+
+
+db = AIMemory.open(".aimemory-extractor", extractor=DemoExtractor())
+db.ingest_messages(
+    scope=scope,
+    messages=[
+        {"role": "user", "content": "需要简洁的发布说明。"},
+        {"role": "assistant", "content": "会先给摘要再给步骤。"},
+    ],
 )
 ```
 
-如果平台 LLM 不可用，系统会自动回退本地压缩，并把 job 状态标成 `degraded`。
-
-## 8. 运行时绑定平台 LLM
-
-如果 `AIMemory` 由宿主平台统一创建，也可以在实例化后再绑定：
+## 7. 查看历史、删除与恢复
 
 ```python
-memory.bind_platform_llm(
-    plugin_name="demo.platform.llm",
-    settings={"endpoint": "https://platform.internal/llm"},
-)
+history = scoped.history(record["head_id"])
+archived = scoped.archive(record["head_id"])
+restored_archive = scoped.restore_archive(record["head_id"])
+deleted = scoped.delete(record["head_id"])
+restored = scoped.restore(record["head_id"])
 ```
 
-也可以直接注入对象：
+`history()` 会返回：
+
+- `versions`
+- `events`
+
+其中 `versions[*].state` 是版本视图状态；`superseded` 只会出现在这里或 package export 的版本视图里。
+`archive()` 后记录默认不会再出现在普通搜索结果里，`restore_archive()` 会重新排入向量重建任务。
+
+## 8. 导出与迁移
+
+### 快照级导出
 
 ```python
-memory.bind_platform_llm(DemoPlatformLLM(endpoint="https://platform.internal/llm"))
+scoped.export_jsonl("exports/memory.jsonl")
+scoped.import_jsonl("exports/memory.jsonl")
 ```
 
-## 9. 平台事件联动
+这条链路只处理“当前记录视图”。
 
-默认 `memory.events` 已经实现了一套面向协同平台的事件编排：
-
-- `on_turn_end(...)`
-- `on_agent_end(...)`
-- `on_handoff(...)`
-- `on_session_close(...)`
-
-例如：
+### 历史级导出
 
 ```python
-result = memory.events.on_turn_end(
-    session_id=session["id"],
-    turn_id="turn-123",
-    auto_recall=True,
-    auto_context=True,
-    use_platform_llm=True,
-)
+package_info = scoped.export_package("exports/history-package")
+stats = scoped.import_package("exports/history-package")
 ```
 
-这类事件适合挂在平台 runtime 的生命周期钩子上。
+package 目录包含：
 
-## 10. ACL
+- `manifest.json`
+- `heads.jsonl`
+- `versions.jsonl`
+- `chunks.jsonl`
+- `events.jsonl`
+- `links.jsonl`
+- package 会保留 archived / deleted head 状态，以及 version 级 `state` 投影。
 
-多人多智能体协作下，建议显式授权，不要只依赖默认 owner 可见。
+这条链路会保留 head/version/chunk/history 结构，并在导入后重建向量索引任务。
+
+## 9. 维护操作
+
+### flush
 
 ```python
-scoped.api.acl.grant(
-    resource_type="handoff",
-    resource_scope="handoff",
-    principal_type="agent",
-    principal_id="agent.executor",
-    permission="read",
-)
+stats = scoped.flush()
 ```
 
-修改型接口内部已经覆盖更多 `write / manage` 检查，不只是 memory id 入口。
+`flush()` 会：
 
-## 11. MCP 仅为可选工具面
+- 刷出 outbox 向量任务
+- 刷回 access delta
+- 执行 lifecycle 调整
 
-如果你需要把 `aimemory` 暴露给外部 agent 工具链，可以使用：
+### lifecycle
 
 ```python
-adapter = scoped.create_mcp_adapter()
-manifest = adapter.manifest()
+stats = scoped.run_lifecycle()
 ```
 
-但要区分两件事：
+### recovery
 
-- `AIMemoryMCPAdapter` 是工具暴露层
-- 平台 LLM 压缩接入应该用插件注册，不应该靠 MCP 调内部压缩
+```python
+stats = scoped.recover()
+```
+
+### reindex / compact
+
+```python
+count = scoped.reindex()
+scoped.compact()
+```
+
+## 10. 关闭资源
+
+```python
+db.close()
+```
+
+或者：
+
+```python
+from aimemory import AIMemory
+
+with AIMemory.open(".aimemory-demo") as db:
+    db.put(scope=scope, text="临时写入", kind="fact")
+```
+
+## 常见建议
+
+- runtime 内高频调用推荐先拿 `scoped = db.scoped(scope)`
+- 需要更稳定的结果语义时，优先用 `query()` 而不是 `search()`
+- 如果调用方已经有向量，可以在 `put(..., vector=[...])` 时直接传入，避免该条记录后续重复 document embedding
+- 如果你要迁移完整历史，优先用 `export_package()` / `import_package()`
